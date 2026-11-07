@@ -317,41 +317,78 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
             })
 
     # 3. Cross-Reconciliation DQ Detection Engine
+    # 3. Precision Mold-Matching DQ Engine (Joint Win + SP Deficit Solver)
     if official_data:
+        import itertools
         for t in all_teams:
             if t not in official_data:
                 continue
+
             off_wins = official_data[t].get("Wins")
+            off_ties = official_data[t].get("Ties")
             off_sp = official_data[t].get("SP")
 
-            # Team DQ on a match their alliance won
+            # What stats look like if NO DQs occurred on the field
             calc_wins = sum(1 for m in team_match_history[t] if m["result"] == "Win")
-            if off_wins is not None and calc_wins > off_wins:
-                wins_to_remove = calc_wins - off_wins
-                for m in team_match_history[t]:
-                    if wins_to_remove <= 0:
-                        break
-                    p = m["partner"]
-                    p_off_wins = official_data.get(p, {}).get("Wins")
-                    p_calc_wins = sum(1 for pm in team_match_history[p] if pm["result"] == "Win")
-                    if p_off_wins == p_calc_wins:
-                        match_dqs.add((m["match_key"], t))
-                        auto_detected_dqs.append(f"Auto-Reconciled: Team **{t}** DQ detected in **{m['match']}** (Partner {p} kept win).")
-                        wins_to_remove -= 1
-
-            # Team DQ on a match their alliance lost (0 SP granted)
+            calc_ties = sum(1 for m in team_match_history[t] if m["result"] == "Tie")
             calc_sp = sum(m["losing_score"] for m in team_match_history[t])
-            if off_sp is not None and calc_sp > off_sp:
-                sp_deficit = calc_sp - off_sp
-                for m in team_match_history[t]:
-                    if m["result"] == "Loss" and m["losing_score"] == sp_deficit and (m["match_key"], t) not in match_dqs:
-                        match_dqs.add((m["match_key"], t))
-                        auto_detected_dqs.append(f"Auto-Reconciled: Team **{t}** DQ detected on loss in **{m['match']}** ({sp_deficit} SP zeroed out).")
+
+            # Measure the exact missing deficits
+            win_deficit = (calc_wins - off_wins) if off_wins is not None else 0
+            tie_deficit = (calc_ties - off_ties) if off_ties is not None else 0
+            sp_deficit = (calc_sp - off_sp) if off_sp is not None else 0
+
+            # CASE A: DQ occurred on a Winning match (lost Win credit AND forfeited SP)
+            if win_deficit > 0:
+                win_matches = [m for m in team_match_history[t] if m["result"] == "Win"]
+                matched = False
+
+                # Mold match: Find the exact match (or combo) whose losing score equals sp_deficit
+                for combo in itertools.combinations(win_matches, win_deficit):
+                    if sum(m["losing_score"] for m in combo) == sp_deficit:
+                        for m in combo:
+                            match_dqs.add((m["match_key"], t))
+                            auto_detected_dqs.append(
+                                f"Mold Match: Team **{t}** DQ isolated to **{m['match']}** "
+                                f"(Win revoked, {m['losing_score']} SP forfeited; Partner {m['partner']} kept win)."
+                            )
+                        matched = True
                         break
 
-    # 4. Map Manual Overrides
-    for t_ident, t_clean in [("red1", r1_col), ("red2", r2_col), ("blue1", b1_col), ("blue2", b2_col)]:
-        pass
+                # Fallback: Partner triangulation if scores had rounding or surrogate variance
+                if not matched:
+                    for m in win_matches:
+                        p = m["partner"]
+                        p_off_wins = official_data.get(p, {}).get("Wins")
+                        p_calc_wins = sum(1 for pm in team_match_history.get(p, []) if pm["result"] == "Win")
+                        if p_off_wins == p_calc_wins:
+                            match_dqs.add((m["match_key"], t))
+                            auto_detected_dqs.append(
+                                f"Auto-Reconciled: Team **{t}** DQ detected in **{m['match']}** "
+                                f"(Partner {p} kept win)."
+                            )
+                            break
+
+            # CASE B: DQ occurred on a Tied match
+            elif tie_deficit > 0:
+                tie_matches = [m for m in team_match_history[t] if m["result"] == "Tie"]
+                for m in tie_matches:
+                    if m["losing_score"] == sp_deficit or sp_deficit == 0:
+                        match_dqs.add((m["match_key"], t))
+                        auto_detected_dqs.append(f"Mold Match: Team **{t}** DQ detected on Tie in **{m['match']}**.")
+                        break
+
+            # CASE C: DQ occurred on a Lost match (Win count unchanged, but 0 SP awarded)
+            elif sp_deficit > 0:
+                loss_matches = [m for m in team_match_history[t] if m["result"] == "Loss"]
+                for m in loss_matches:
+                    if m["losing_score"] == sp_deficit:
+                        match_dqs.add((m["match_key"], t))
+                        auto_detected_dqs.append(
+                            f"Mold Match: Team **{t}** DQ detected on loss in **{m['match']}** "
+                            f"({sp_deficit} SP zeroed out per Rule GG6)."
+                        )
+                        break
 
     # 5. Build official matrix honoring V5RC Rule GG6
     stats = {t: {"Wins": 0, "Losses": 0, "Ties": 0, "WP": 0, "SP": 0} for t in all_teams}
