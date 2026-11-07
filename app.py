@@ -21,6 +21,7 @@ app_mode = st.sidebar.radio(
     "Navigation:",
     [
         "TM Event Analyzer & Archive",
+        "Season Historical Stats & Dossiers",
         "Top 25 Poll & Community Rankings",
         "Future Tournament Sandbox"
     ]
@@ -37,13 +38,11 @@ def parse_file(file):
     if file is None:
         return None
 
-    # Check for empty file
     if isinstance(file, str) and os.path.exists(file):
         if os.path.getsize(file) == 0:
             st.warning(f"File '{os.path.basename(file)}' is empty (0 bytes).")
             return None
 
-    # Read leading bytes to inspect binary signatures
     header_bytes = b""
     try:
         if isinstance(file, str):
@@ -88,7 +87,6 @@ def parse_file(file):
         except Exception:
             break
 
-    # 4. Final fallback
     try:
         if hasattr(file, "seek"):
             file.seek(0)
@@ -99,9 +97,6 @@ def parse_file(file):
         return None
 
 def clean_team_token(token):
-    """
-    Extracts clean team string and flags DQ tags (e.g. '2011B (DQ)' or '11124X*').
-    """
     raw = str(token).strip()
     is_dq = bool(re.search(r'\bDQ\b|\(DQ\)', raw, re.IGNORECASE))
     clean_team = re.sub(r'[\(\[\{]?\bDQ\b[\)\]\}]?|\*', '', raw, flags=re.IGNORECASE).strip()
@@ -182,40 +177,12 @@ def load_preloaded_event_files(event_prefix):
         elif not matches_file:
             matches_file = full_path
 
-    with st.sidebar.expander("🔍 Loaded File Diagnostics", expanded=False):
-        st.write(f"**Prefix:** `{event_prefix}`")
-        st.write(f"**Matches File:** `{os.path.basename(matches_file) if matches_file else 'None Found'}`")
-        st.write(f"**Rankings File:** `{os.path.basename(rankings_file) if rankings_file else 'None Found'}`")
-        st.write("**Folder Files:**", all_files)
-
     df_m = parse_file(matches_file) if matches_file else None
     df_r = parse_file(rankings_file) if rankings_file else None
     return df_m, df_r
 
-def load_all_archived_teams():
-    events = get_available_events()
-    all_records = []
-    for ev in events:
-        _, df_r = load_preloaded_event_files(ev)
-        if df_r is not None and "Team" in df_r.columns:
-            df_r["Tournament"] = ev
-            all_records.append(df_r)
-        else:
-            path = os.path.join(TOURNAMENTS_DIR, f"{ev}.csv")
-            if os.path.exists(path):
-                try:
-                    df = pd.read_csv(path)
-                    if "Team" in df.columns:
-                        df["Tournament"] = ev
-                        all_records.append(df)
-                except Exception:
-                    continue
-    if all_records:
-        return pd.concat(all_records, ignore_index=True)
-    return pd.DataFrame()
-
 # ==========================================
-# CORE ANALYTICS & AUTO-RECONCILIATION
+# CORE ANALYTICAL ENGINE
 # ==========================================
 def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
     df_matches.columns = [str(c).strip() for c in df_matches.columns]
@@ -274,14 +241,13 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
             if loss_col: df_ranks["Losses"] = pd.to_numeric(df_ranks[loss_col], errors="coerce").fillna(0).astype(int)
             if ties_col: df_ranks["Ties"] = pd.to_numeric(df_ranks[ties_col], errors="coerce").fillna(0).astype(int)
 
-            # Auto-calculate AWP: AWP = WP - (2 * Wins + Ties)
             if all(k in df_ranks.columns for k in ["WP", "Wins", "Ties"]):
                 df_ranks["AWP"] = (df_ranks["WP"] - (2 * df_ranks["Wins"] + df_ranks["Ties"])).clip(lower=0)
 
             for _, r in df_ranks.iterrows():
                 official_data[r["Team"]] = r.to_dict()
 
-    # 2. Pre-scan matches: log tags, score-winner flips, and per-team match list
+    # 2. Pre-scan matches
     team_match_history = {t: [] for t in all_teams}
     for _, row in qual_df.iterrows():
         m_label = str(row[match_col]).strip()
@@ -316,8 +282,7 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
                 "alliance": alliance, "result": res, "losing_score": losing_sc
             })
 
-    # 3. Cross-Reconciliation DQ Detection Engine
-    # 3. Precision Mold-Matching DQ Engine (Joint Win + SP Deficit Solver)
+    # 3. Precision Mold-Matching DQ Engine
     if official_data:
         import itertools
         for t in all_teams:
@@ -328,22 +293,17 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
             off_ties = official_data[t].get("Ties")
             off_sp = official_data[t].get("SP")
 
-            # What stats look like if NO DQs occurred on the field
             calc_wins = sum(1 for m in team_match_history[t] if m["result"] == "Win")
             calc_ties = sum(1 for m in team_match_history[t] if m["result"] == "Tie")
             calc_sp = sum(m["losing_score"] for m in team_match_history[t])
 
-            # Measure the exact missing deficits
             win_deficit = (calc_wins - off_wins) if off_wins is not None else 0
             tie_deficit = (calc_ties - off_ties) if off_ties is not None else 0
             sp_deficit = (calc_sp - off_sp) if off_sp is not None else 0
 
-            # CASE A: DQ occurred on a Winning match (lost Win credit AND forfeited SP)
             if win_deficit > 0:
                 win_matches = [m for m in team_match_history[t] if m["result"] == "Win"]
                 matched = False
-
-                # Mold match: Find the exact match (or combo) whose losing score equals sp_deficit
                 for combo in itertools.combinations(win_matches, win_deficit):
                     if sum(m["losing_score"] for m in combo) == sp_deficit:
                         for m in combo:
@@ -355,7 +315,6 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
                         matched = True
                         break
 
-                # Fallback: Partner triangulation if scores had rounding or surrogate variance
                 if not matched:
                     for m in win_matches:
                         p = m["partner"]
@@ -369,7 +328,6 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
                             )
                             break
 
-            # CASE B: DQ occurred on a Tied match
             elif tie_deficit > 0:
                 tie_matches = [m for m in team_match_history[t] if m["result"] == "Tie"]
                 for m in tie_matches:
@@ -378,7 +336,6 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
                         auto_detected_dqs.append(f"Mold Match: Team **{t}** DQ detected on Tie in **{m['match']}**.")
                         break
 
-            # CASE C: DQ occurred on a Lost match (Win count unchanged, but 0 SP awarded)
             elif sp_deficit > 0:
                 loss_matches = [m for m in team_match_history[t] if m["result"] == "Loss"]
                 for m in loss_matches:
@@ -390,7 +347,7 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
                         )
                         break
 
-    # 5. Build official matrix honoring V5RC Rule GG6
+    # 4. Build official matrix honoring V5RC Rule GG6
     stats = {t: {"Wins": 0, "Losses": 0, "Ties": 0, "WP": 0, "SP": 0} for t in all_teams}
     for _, row in qual_df.iterrows():
         m_label = str(row[match_col]).strip(); m_key = m_label.lower()
@@ -436,7 +393,7 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
 
     rank_map = {row["Team"]: row["Actual_Rank"] for _, row in df_ranks.iterrows()}
 
-    # 6. Schedule Gauntlet & Individual Leverage
+    # 5. Schedule Gauntlet & Individual Leverage
     carry_sums = {t: 0.0 for t in all_teams}
     teammates = {t: [] for t in all_teams}
     opponents = {t: [] for t in all_teams}
@@ -554,6 +511,45 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
     return df_final, df_audit
 
 # ==========================================
+# MULTI-EVENT SEASON DATA LOADER
+# ==========================================
+@st.cache_data(show_spinner=False)
+def load_all_season_event_data():
+    """
+    Scans data/tournaments/ for all tournament archives and computes
+    complete analytics metrics across every event.
+    """
+    events = get_available_events()
+    all_dfs = []
+
+    for ev in events:
+        df_m, df_r = load_preloaded_event_files(ev)
+        if df_m is not None:
+            try:
+                df_res, _ = analyze_tournament(df_m, df_r)
+                if df_res is not None and not df_res.empty:
+                    df_res["Tournament"] = ev
+                    all_dfs.append(df_res)
+                    continue
+            except Exception:
+                pass
+        
+        # Fallback to standalone processed CSV
+        path = os.path.join(TOURNAMENTS_DIR, f"{ev}.csv")
+        if os.path.exists(path):
+            try:
+                df_saved = pd.read_csv(path)
+                if "Team" in df_saved.columns:
+                    df_saved["Tournament"] = ev
+                    all_dfs.append(df_saved)
+            except Exception:
+                continue
+
+    if all_dfs:
+        return pd.concat(all_dfs, ignore_index=True)
+    return pd.DataFrame()
+
+# ==========================================
 # MODE 1: TM EVENT ANALYZER & ARCHIVE
 # ==========================================
 if app_mode == "TM Event Analyzer & Archive":
@@ -631,15 +627,113 @@ if app_mode == "TM Event Analyzer & Archive":
         st.info("👈 Upload your Tournament Manager files or choose a preloaded tournament from the sidebar.")
 
 # ==========================================
-# MODE 2: TOP 25 COMMUNITY VOTING & CONSENSUS
+# MODE 2: SEASON HISTORICAL STATS & DOSSIERS
+# ==========================================
+elif app_mode == "Season Historical Stats & Dossiers":
+    st.subheader("📊 Overall Season Historical Team Analytics")
+    st.write("Aggregated season-wide performance metrics compiled across all uploaded tournament archives.")
+
+    df_season = load_all_season_event_data()
+
+    if df_season.empty:
+        st.info("No tournament archives found in `data/tournaments/`. Upload and archive events in Mode 1 to populate season stats.")
+    else:
+        # Build Season Aggregation Table
+        agg_rows = []
+        for team, grp in df_season.groupby("Team"):
+            events_played = len(grp)
+            tot_wins = grp["Wins"].sum() if "Wins" in grp.columns else 0
+            tot_losses = grp["Losses"].sum() if "Losses" in grp.columns else 0
+            tot_ties = grp["Ties"].sum() if "Ties" in grp.columns else 0
+            tot_matches = tot_wins + tot_losses + tot_ties
+            win_pct = round(((tot_wins + 0.5 * tot_ties) / max(1, tot_matches)) * 100, 1)
+
+            avg_rank = round(grp["Actual_Rank"].mean(), 1) if "Actual_Rank" in grp.columns else np.nan
+            best_rank = int(grp["Actual_Rank"].min()) if "Actual_Rank" in grp.columns else np.nan
+            mean_carry = round(grp["Carry_Factor"].mean(), 1) if "Carry_Factor" in grp.columns else np.nan
+            mean_ap = round(grp["AP"].mean(), 1) if "AP" in grp.columns else np.nan
+            mean_sp = round(grp["SP"].mean(), 1) if "SP" in grp.columns else np.nan
+            tot_awp = int(grp["AWP"].sum()) if "AWP" in grp.columns else 0
+            mean_sos = round(grp["SOS_Rank"].mean(), 1) if "SOS_Rank" in grp.columns else np.nan
+            mean_luck = round(grp["Lucky_Factor"].mean(), 1) if "Lucky_Factor" in grp.columns else np.nan
+
+            agg_rows.append({
+                "Team": team,
+                "Events_Played": events_played,
+                "Record": f"{tot_wins}-{tot_losses}-{tot_ties}",
+                "Win_Pct": win_pct,
+                "Best_Finish": f"#{best_rank}" if pd.notna(best_rank) else "N/A",
+                "Avg_Finish": avg_rank,
+                "Mean_Carry_Factor": mean_carry,
+                "Mean_AP": mean_ap,
+                "Total_AWP": tot_awp,
+                "Mean_SP": mean_sp,
+                "Avg_SOS_Rank": mean_sos,
+                "Mean_Lucky_Factor": mean_luck,
+                "_raw_best": best_rank
+            })
+
+        df_leaderboard = pd.DataFrame(agg_rows)
+
+        # Filters Row
+        flt_col1, flt_col2, flt_col3 = st.columns([1, 1, 2])
+        with flt_col1:
+            min_ev = st.number_input("Minimum Events Attended:", min_value=1, max_value=max(1, int(df_leaderboard["Events_Played"].max())), value=1, step=1)
+        with flt_col2:
+            sort_by = st.selectbox(
+                "Sort Leaderboard By:",
+                ["Mean_Carry_Factor", "Win_Pct", "Avg_Finish", "Mean_AP", "Events_Played"],
+                index=0
+            )
+        with flt_col3:
+            search_query = st.text_input("Filter by Team #:", placeholder="e.g. 2011, 6741, 6978").strip().upper()
+
+        # Apply Filters
+        filtered_df = df_leaderboard[df_leaderboard["Events_Played"] >= min_ev].copy()
+        if search_query:
+            filtered_df = filtered_df[filtered_df["Team"].str.contains(search_query, na=False)]
+
+        ascending = True if sort_by in ["Avg_Finish", "_raw_best"] else False
+        filtered_df = filtered_df.sort_values(by=[sort_by], ascending=[ascending]).reset_index(drop=True)
+        display_df = filtered_df.drop(columns=["_raw_best"])
+        display_df.index = display_df.index + 1
+
+        st.dataframe(display_df, use_container_width=True)
+
+        csv_season = display_df.to_csv(index=False).encode("utf-8")
+        st.download_button("📥 Export Season Leaderboard CSV", data=csv_season, file_name="season_historical_leaderboard.csv", mime="text/csv")
+
+        # Section 2: Deep-Dive Individual Team Dossier
+        st.markdown("---")
+        st.subheader("🔍 Individual Team Season Dossier & History Log")
+        all_teams_list = sorted(df_leaderboard["Team"].tolist())
+        selected_team = st.selectbox("Select Team to Inspect:", all_teams_list)
+
+        t_records = df_season[df_season["Team"] == selected_team].reset_index(drop=True)
+        t_summary = df_leaderboard[df_leaderboard["Team"] == selected_team].iloc[0]
+
+        d_c1, d_c2, d_c3, d_c4, d_c5, d_c6 = st.columns(6)
+        d_c1.metric("Events Attended", t_summary["Events_Played"])
+        d_c2.metric("Best Seeding Finish", t_summary["Best_Finish"])
+        d_c3.metric("Avg Seeding Finish", f"#{t_summary['Avg_Finish']}")
+        d_c4.metric("Season Record", t_summary["Record"], f"{t_summary['Win_Pct']}% Win Rate")
+        d_c5.metric("Mean Carry Factor", t_summary["Mean_Carry_Factor"])
+        d_c6.metric("Mean AP", t_summary["Mean_AP"])
+
+        st.markdown(f"#### **{selected_team}** Tournament Log")
+        log_cols = [c for c in ["Tournament", "Actual_Rank", "Record", "WP", "AP", "SP", "AWP", "Carry_Factor", "SOS_Rank", "Lucky_Factor"] if c in t_records.columns]
+        st.dataframe(t_records[log_cols], use_container_width=True)
+
+# ==========================================
+# MODE 3: TOP 25 COMMUNITY VOTING & CONSENSUS
 # ==========================================
 elif app_mode == "Top 25 Poll & Community Rankings":
     st.subheader("🏆 V5RC Community Top 25 Power Rankings Portal")
     st.write("Submit official ballots using aggregated tournament resumes, or inspect community consensus standings.")
 
-    tab_ballot, tab_consensus, tab_dossier = st.tabs(["🗳️ Submit Top 25 Ballot", "📊 Consensus Power Rankings", "📁 Team Dossiers"])
-    df_global = load_all_archived_teams()
-    known_teams = sorted(df_global["Team"].unique().tolist()) if not df_global.empty else []
+    tab_ballot, tab_consensus = st.tabs(["🗳️ Submit Top 25 Ballot", "📊 Consensus Power Rankings"])
+    df_season = load_all_season_event_data()
+    known_teams = sorted(df_season["Team"].unique().tolist()) if not df_season.empty else []
 
     with tab_ballot:
         st.markdown("### Official Top 25 Ballot")
@@ -734,26 +828,8 @@ elif app_mode == "Top 25 Poll & Community Rankings":
         else:
             st.info("No ballots submitted yet. Be the first to submit a ballot in the 'Submit Top 25 Ballot' tab!")
 
-    with tab_dossier:
-        st.markdown("### Season Team Dossiers & Performance History")
-        if not df_global.empty:
-            inspect_team = st.selectbox("Select Team to Inspect:", known_teams)
-            team_records = df_global[df_global["Team"] == inspect_team]
-
-            t_c1, t_c2, t_c3, t_c4 = st.columns(4)
-            t_c1.metric("Events Attended", len(team_records))
-            t_c2.metric("Best Finish", f"#{int(team_records['Actual_Rank'].min())}")
-            t_c3.metric("Avg Finish", f"#{team_records['Actual_Rank'].mean():.1f}")
-            if "Carry_Factor" in team_records.columns:
-                t_c4.metric("Mean Carry Factor", f"{team_records['Carry_Factor'].mean():.1f}")
-
-            display_cols = [c for c in ["Tournament", "Actual_Rank", "WP", "AP", "SP", "Carry_Factor", "SOS_Rank", "Lucky_Factor"] if c in team_records.columns]
-            st.dataframe(team_records[display_cols].reset_index(drop=True), use_container_width=True)
-        else:
-            st.info("No tournament archives found. Save an analyzed tournament in Mode 1 to build season team profiles.")
-
 # ==========================================
-# MODE 3: FUTURE TOURNAMENT SANDBOX
+# MODE 4: FUTURE TOURNAMENT SANDBOX
 # ==========================================
 elif app_mode == "Future Tournament Sandbox":
     st.subheader("Upcoming Event Predictions, Validation & Mock Alliance Selection")
