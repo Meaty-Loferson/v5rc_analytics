@@ -132,21 +132,39 @@ def get_available_events():
     return sorted(list(events))
 
 def load_preloaded_event_files(event_prefix):
-    """Finds and loads paired matches and rankings files for a chosen tournament."""
+    """
+    Scans data/tournaments/ for the chosen event prefix and reports 
+    detected match and rankings files in the sidebar.
+    """
     matches_file = None
     rankings_file = None
 
-    for f in os.listdir(TOURNAMENTS_DIR):
+    if not os.path.exists(TOURNAMENTS_DIR):
+        st.sidebar.error("Tournaments directory 'data/tournaments/' not found.")
+        return None, None
+
+    all_files = os.listdir(TOURNAMENTS_DIR)
+    
+    # Find all files starting with event_prefix
+    matching_files = [f for f in all_files if f.lower().startswith(event_prefix.lower())]
+
+    for f in matching_files:
         full_path = os.path.join(TOURNAMENTS_DIR, f)
-        base, _ = os.path.splitext(f)
-        if base.startswith(event_prefix):
-            lower_name = f.lower()
-            if any(k in lower_name for k in ["rank", "standing"]):
-                rankings_file = full_path
-            elif any(k in lower_name for k in ["match", "qual", "result"]):
-                matches_file = full_path
-            elif not matches_file:
-                matches_file = full_path
+        lower_name = f.lower()
+
+        if any(k in lower_name for k in ["rank", "standing"]):
+            rankings_file = full_path
+        elif any(k in lower_name for k in ["match", "qual", "result", "schedule"]):
+            matches_file = full_path
+        elif not matches_file:
+            matches_file = full_path
+
+    # Sidebar diagnostics
+    with st.sidebar.expander("🔍 Loaded File Details", expanded=False):
+        st.write(f"**Prefix:** `{event_prefix}`")
+        st.write(f"**Matches File:** `{os.path.basename(matches_file) if matches_file else 'None Found'}`")
+        st.write(f"**Rankings File:** `{os.path.basename(rankings_file) if rankings_file else 'None Found'}`")
+        st.write("**All tournament folder files:**", all_files)
 
     df_m = parse_file(matches_file) if matches_file else None
     df_r = parse_file(rankings_file) if rankings_file else None
