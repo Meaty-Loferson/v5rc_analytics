@@ -6,7 +6,7 @@ from datetime import datetime
 
 st.set_page_config(page_title="V5RC Tournament Intelligence & Community Hub", layout="wide")
 
-# Ensure persistent data directories exist
+# Directory paths for persistent storage
 DATA_DIR = "data"
 TOURNAMENTS_DIR = os.path.join(DATA_DIR, "tournaments")
 BALLOTS_DIR = os.path.join(DATA_DIR, "ballots")
@@ -28,12 +28,17 @@ app_mode = st.sidebar.radio(
 )
 
 # ==========================================
-# PARSING & UTILITIES
+# CORE PARSING & MATHEMATICAL ENGINE
 # ==========================================
 def parse_file(file):
-    if file.name.lower().endswith(".csv"):
+    if hasattr(file, "name"):
+        fname = file.name.lower()
+    else:
+        fname = str(file).lower()
+
+    if fname.endswith(".csv"):
         return pd.read_csv(file)
-    if file.name.lower().endswith(".xlsx"):
+    if fname.endswith(".xlsx"):
         return pd.read_excel(file, engine="openpyxl")
     try:
         return pd.read_excel(file, engine="calamine")
@@ -64,9 +69,193 @@ def parse_manual_overrides(text):
                     overrides[m_key] = {"winner": win_val}
     return overrides
 
+def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
+    df_matches.columns = [str(c).strip() for c in df_matches.columns]
+    match_col = next((c for c in df_matches.columns if "match" in c.lower()), None)
+    r1_col = next((c for c in df_matches.columns if "red" in c.lower() and "1" in c.lower()), None)
+    r2_col = next((c for c in df_matches.columns if "red" in c.lower() and "2" in c.lower()), None)
+    b1_col = next((c for c in df_matches.columns if "blue" in c.lower() and "1" in c.lower()), None)
+    b2_col = next((c for c in df_matches.columns if "blue" in c.lower() and "2" in c.lower()), None)
+    r_score_col = next((c for c in df_matches.columns if "red" in c.lower() and "score" in c.lower()), None)
+    b_score_col = next((c for c in df_matches.columns if "blue" in c.lower() and "score" in c.lower()), None)
+    winner_col = next((c for c in df_matches.columns if "winner" in c.lower()), None)
+
+    if not all([match_col, r1_col, r2_col, b1_col, b2_col, r_score_col, b_score_col]):
+        st.error(f"Could not map match columns. Detected headers: {list(df_matches.columns)}")
+        return None, None
+
+    qual_df = df_matches[df_matches[match_col].astype(str).str.startswith("Qualifier")].copy()
+    qual_df[r_score_col] = pd.to_numeric(qual_df[r_score_col], errors="coerce").fillna(0.0)
+    qual_df[b_score_col] = pd.to_numeric(qual_df[b_score_col], errors="coerce").fillna(0.0)
+    overrides = parse_manual_overrides(overrides_text)
+
+    raw_teams = set()
+    for col in [r1_col, r2_col, b1_col, b2_col]:
+        raw_teams.update(qual_df[col].dropna().astype(str).str.strip().unique())
+    all_teams = sorted([t for t in raw_teams if t and t.lower() != "nan" and not t.isdigit()])
+
+    df_ranks = None
+    if df_rankings_file is not None:
+        df_rankings_file.columns = [str(c).strip() for c in df_rankings_file.columns]
+        team_rk_col = next((c for c in df_rankings_file.columns if "team" in c.lower()), None)
+        rk_col = next((c for c in df_rankings_file.columns if "rank" in c.lower()), None)
+        wp_col = next((c for c in df_rankings_file.columns if "wp" in c.lower()), None)
+        sp_col = next((c for c in df_rankings_file.columns if "sp" in c.lower()), None)
+        if team_rk_col and rk_col:
+            df_ranks = df_rankings_file.copy()
+            df_ranks["Team"] = df_ranks[team_rk_col].astype(str).str.strip()
+            df_ranks["Actual_Rank"] = pd.to_numeric(df_ranks[rk_col], errors="coerce").fillna(99).astype(int)
+            if wp_col: df_ranks["WP"] = pd.to_numeric(df_ranks[wp_col], errors="coerce").fillna(0).astype(int)
+            if sp_col: df_ranks["SP"] = pd.to_numeric(df_ranks[sp_col], errors="coerce").fillna(0).astype(int)
+
+    if df_ranks is None:
+        stats = {t: {"Wins": 0, "Losses": 0, "Ties": 0, "WP": 0, "SP": 0} for t in all_teams}
+        for _, row in qual_df.iterrows():
+            m_label = str(row[match_col]).strip().lower()
+            r_teams = [str(row[r1_col]).strip(), str(row[r2_col]).strip()]
+            b_teams = [str(row[b1_col]).strip(), str(row[b2_col]).strip()]
+            r_sc = float(row[r_score_col])
+            b_sc = float(row[b_score_col])
+            w = str(row[winner_col]).strip() if winner_col else ""
+
+            if m_label in overrides:
+                w = overrides[m_label]["winner"]
+            elif w not in ["Red", "Blue", "Tie"]:
+                w = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
+
+            losing_score = int(min(r_sc, b_sc))
+            if w == "Red":
+                for t in r_teams:
+                    if t in stats: stats[t]["Wins"] += 1; stats[t]["WP"] += 2; stats[t]["SP"] += losing_score
+                for t in b_teams:
+                    if t in stats: stats[t]["Losses"] += 1; stats[t]["SP"] += losing_score
+            elif w == "Blue":
+                for t in b_teams:
+                    if t in stats: stats[t]["Wins"] += 1; stats[t]["WP"] += 2; stats[t]["SP"] += losing_score
+                for t in r_teams:
+                    if t in stats: stats[t]["Losses"] += 1; stats[t]["SP"] += losing_score
+            else:
+                for t in r_teams + b_teams:
+                    if t in stats: stats[t]["Ties"] += 1; stats[t]["WP"] += 1; stats[t]["SP"] += losing_score
+
+        df_ranks = pd.DataFrame([{"Team": t, **s} for t, s in stats.items()])
+        df_ranks = df_ranks.sort_values(by=["WP", "SP"], ascending=[False, False]).reset_index(drop=True)
+        df_ranks["Actual_Rank"] = df_ranks.index + 1
+
+    rank_map = {row["Team"]: row["Actual_Rank"] for _, row in df_ranks.iterrows()}
+    carry_sums = {t: 0.0 for t in all_teams}
+    teammates = {t: [] for t in all_teams}
+    opponents = {t: [] for t in all_teams}
+    audit_rows = []
+
+    for _, row in qual_df.iterrows():
+        m_label = str(row[match_col]).strip()
+        r1, r2 = str(row[r1_col]).strip(), str(row[r2_col]).strip()
+        b1, b2 = str(row[b1_col]).strip(), str(row[b2_col]).strip()
+        r_sc = float(row[r_score_col])
+        b_sc = float(row[b_score_col])
+        w = str(row[winner_col]).strip() if winner_col else ""
+
+        if m_label.lower() in overrides:
+            w = overrides[m_label.lower()]["winner"]
+        elif w not in ["Red", "Blue", "Tie"]:
+            w = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
+
+        # Red Alliance Calculations
+        if r1 in rank_map and r2 in rank_map and b1 in rank_map and b2 in rank_map:
+            for t, p in [(r1, r2), (r2, r1)]:
+                teammates[t].append(rank_map[p])
+                opponents[t].extend([rank_map[b1], rank_map[b2]])
+                delta_r = ((rank_map[t] + rank_map[p]) / 2.0) - ((rank_map[b1] + rank_map[b2]) / 2.0)
+                base = (rank_map[p] - rank_map[t]) + 2.0 * max(0.0, delta_r)
+                if w == "Red":
+                    carry = base * 1.0
+                elif w == "Tie":
+                    carry = base * 0.5
+                else:
+                    w_m = -0.25 * max(0.0, 1.0 - (r_sc / max(b_sc, 1.0)))
+                    carry = -abs(base) * abs(w_m) if base > 0 else base * (1.0 - abs(w_m))
+                carry_sums[t] += carry
+                audit_rows.append({
+                    "Match": m_label, "Team": t, "Alliance": "Red", "Partner": p, 
+                    "Opponents": f"{b1}, {b2}", "Score": f"{int(r_sc)}-{int(b_sc)}", 
+                    "Result": "Win" if w == "Red" else ("Tie" if w == "Tie" else "Loss"), 
+                    "Leverage": round(carry, 2)
+                })
+
+        # Blue Alliance Calculations
+        if b1 in rank_map and b2 in rank_map and r1 in rank_map and r2 in rank_map:
+            for t, p in [(b1, b2), (b2, b1)]:
+                teammates[t].append(rank_map[p])
+                opponents[t].extend([rank_map[r1], rank_map[r2]])
+                delta_r = ((rank_map[t] + rank_map[p]) / 2.0) - ((rank_map[r1] + rank_map[r2]) / 2.0)
+                base = (rank_map[p] - rank_map[t]) + 2.0 * max(0.0, delta_r)
+                if w == "Blue":
+                    carry = base * 1.0
+                elif w == "Tie":
+                    carry = base * 0.5
+                else:
+                    w_m = -0.25 * max(0.0, 1.0 - (b_sc / max(r_sc, 1.0)))
+                    carry = -abs(base) * abs(w_m) if base > 0 else base * (1.0 - abs(w_m))
+                carry_sums[t] += carry
+                audit_rows.append({
+                    "Match": m_label, "Team": t, "Alliance": "Blue", "Partner": p, 
+                    "Opponents": f"{r1}, {r2}", "Score": f"{int(b_sc)}-{int(r_sc)}", 
+                    "Result": "Win" if w == "Blue" else ("Tie" if w == "Tie" else "Loss"), 
+                    "Leverage": round(carry, 2)
+                })
+
+    num_teams = len(all_teams)
+    median_rank = (num_teams + 1) / 2.0
+    c_vals = list(carry_sums.values())
+    mu = np.mean(c_vals) if c_vals else 0.0
+    sigma = np.std(c_vals, ddof=1) if len(c_vals) > 1 and np.std(c_vals, ddof=1) > 0 else 1.0
+
+    df_ranks["Avg_Teammate_Rank"] = df_ranks["Team"].map(lambda t: round(np.mean(teammates[t]), 2) if t in teammates and teammates[t] else median_rank)
+    df_ranks["Avg_Opponent_Rank"] = df_ranks["Team"].map(lambda t: round(np.mean(opponents[t]), 2) if t in opponents and opponents[t] else median_rank)
+    df_ranks["Schedule_Advantage"] = np.round(df_ranks["Avg_Opponent_Rank"] - df_ranks["Avg_Teammate_Rank"], 2)
+    df_ranks["SOS_Rank"] = df_ranks["Schedule_Advantage"].rank(ascending=True, method="min").astype(int)
+    df_ranks["Carry_Factor"] = df_ranks["Team"].map(lambda t: round(50.0 + 50.0 * ((carry_sums.get(t, 0.0) - mu) / (3.0 * sigma)), 1))
+
+    # Dynamic Expected Rank Intercept
+    intercept = median_rank + (0.6282 * 50.0)
+    std_adv = df_ranks["Schedule_Advantage"].std()
+    z_sched = (df_ranks["Schedule_Advantage"] - df_ranks["Schedule_Advantage"].mean()) / (std_adv if std_adv and std_adv > 0 else 1.0)
+    exp_rank = -0.6282 * df_ranks["Carry_Factor"] + intercept
+    surplus = exp_rank - df_ranks["Actual_Rank"]
+    std_surp = surplus.std()
+    z_surp = (surplus - surplus.mean()) / (std_surp if std_surp and std_surp > 0 else 1.0)
+    comp_z = 0.5 * z_sched + 0.5 * z_surp
+    std_comp = comp_z.std()
+    df_ranks["Lucky_Factor"] = np.round(50.0 + 50.0 * (comp_z / (3.0 * (std_comp if std_comp and std_comp > 0 else 1.0))), 1)
+
+    col_order = ["Actual_Rank", "Team"]
+    for c in ["WP", "AP", "SP", "Wins", "Losses", "Ties"]:
+        if c in df_ranks.columns: col_order.append(c)
+    col_order += ["Avg_Teammate_Rank", "Avg_Opponent_Rank", "Schedule_Advantage", "SOS_Rank", "Carry_Factor", "Lucky_Factor"]
+    
+    return df_ranks[[c for c in col_order if c in df_ranks.columns]].sort_values("Actual_Rank").reset_index(drop=True), pd.DataFrame(audit_rows)
+
+# ==========================================
+# ARCHIVE INGESTION HELPERS (.xls, .xlsx, .csv)
+# ==========================================
 def get_archived_tournaments():
-    files = [f for f in os.listdir(TOURNAMENTS_DIR) if f.endswith(".csv")]
+    valid_exts = (".csv", ".xlsx", ".xls")
+    if not os.path.exists(TOURNAMENTS_DIR):
+        return []
+    files = [f for f in os.listdir(TOURNAMENTS_DIR) if f.lower().endswith(valid_exts)]
     return sorted(files)
+
+def load_tournament_file(filepath):
+    df = parse_file(filepath)
+    df.columns = [str(c).strip() for c in df.columns]
+    
+    # Check if raw match results export or pre-computed table
+    is_raw_match = any("match" in c.lower() for c in df.columns) and any("red" in c.lower() for c in df.columns)
+    if is_raw_match:
+        df_analyzed, _ = analyze_tournament(df)
+        return df_analyzed
+    return df
 
 def load_all_archived_teams():
     all_files = get_archived_tournaments()
@@ -74,9 +263,9 @@ def load_all_archived_teams():
     for f in all_files:
         path = os.path.join(TOURNAMENTS_DIR, f)
         try:
-            df = pd.read_csv(path)
-            if "Team" in df.columns:
-                df["Tournament"] = f.replace(".csv", "")
+            df = load_tournament_file(path)
+            if df is not None and "Team" in df.columns:
+                df["Tournament"] = os.path.splitext(f)[0]
                 all_records.append(df)
         except Exception:
             continue
@@ -102,166 +291,13 @@ if app_mode == "📊 TM Event Analyzer & Archive":
     uploaded_rankings = st.sidebar.file_uploader("2. TM Rankings (.xlsx, .xls, .csv)", type=["xlsx", "xls", "csv"])
     manual_overrides = st.sidebar.text_area("3. Overrides (Optional)", placeholder="e.g.\nTie: Qualifier #58\nDQ: Qualifier #12, Red")
 
-    def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
-        df_matches.columns = [str(c).strip() for c in df_matches.columns]
-        match_col = next((c for c in df_matches.columns if "match" in c.lower()), None)
-        r1_col = next((c for c in df_matches.columns if "red" in c.lower() and "1" in c.lower()), None)
-        r2_col = next((c for c in df_matches.columns if "red" in c.lower() and "2" in c.lower()), None)
-        b1_col = next((c for c in df_matches.columns if "blue" in c.lower() and "1" in c.lower()), None)
-        b2_col = next((c for c in df_matches.columns if "blue" in c.lower() and "2" in c.lower()), None)
-        r_score_col = next((c for c in df_matches.columns if "red" in c.lower() and "score" in c.lower()), None)
-        b_score_col = next((c for c in df_matches.columns if "blue" in c.lower() and "score" in c.lower()), None)
-        winner_col = next((c for c in df_matches.columns if "winner" in c.lower()), None)
-
-        if not all([match_col, r1_col, r2_col, b1_col, b2_col, r_score_col, b_score_col]):
-            st.error(f"Could not map columns: {list(df_matches.columns)}")
-            return None, None
-
-        qual_df = df_matches[df_matches[match_col].astype(str).str.startswith("Qualifier")].copy()
-        qual_df[r_score_col] = pd.to_numeric(qual_df[r_score_col], errors="coerce").fillna(0.0)
-        qual_df[b_score_col] = pd.to_numeric(qual_df[b_score_col], errors="coerce").fillna(0.0)
-        overrides = parse_manual_overrides(overrides_text)
-
-        raw_teams = set()
-        for col in [r1_col, r2_col, b1_col, b2_col]:
-            raw_teams.update(qual_df[col].dropna().astype(str).str.strip().unique())
-        all_teams = sorted([t for t in raw_teams if t and t.lower() != "nan" and not t.isdigit()])
-
-        df_ranks = None
-        if df_rankings_file is not None:
-            df_rankings_file.columns = [str(c).strip() for c in df_rankings_file.columns]
-            team_rk_col = next((c for c in df_rankings_file.columns if "team" in c.lower()), None)
-            rk_col = next((c for c in df_rankings_file.columns if "rank" in c.lower()), None)
-            wp_col = next((c for c in df_rankings_file.columns if "wp" in c.lower()), None)
-            sp_col = next((c for c in df_rankings_file.columns if "sp" in c.lower()), None)
-            if team_rk_col and rk_col:
-                df_ranks = df_rankings_file.copy()
-                df_ranks["Team"] = df_ranks[team_rk_col].astype(str).str.strip()
-                df_ranks["Actual_Rank"] = pd.to_numeric(df_ranks[rk_col], errors="coerce").fillna(99).astype(int)
-                if wp_col: df_ranks["WP"] = pd.to_numeric(df_ranks[wp_col], errors="coerce").fillna(0).astype(int)
-                if sp_col: df_ranks["SP"] = pd.to_numeric(df_ranks[sp_col], errors="coerce").fillna(0).astype(int)
-
-        if df_ranks is None:
-            stats = {t: {"Wins": 0, "Losses": 0, "Ties": 0, "WP": 0, "SP": 0} for t in all_teams}
-            for _, row in qual_df.iterrows():
-                m_label = str(row[match_col]).strip().lower()
-                r_teams = [str(row[r1_col]).strip(), str(row[r2_col]).strip()]
-                b_teams = [str(row[b1_col]).strip(), str(row[b2_col]).strip()]
-                r_sc = float(row[r_score_col])
-                b_sc = float(row[b_score_col])
-                w = str(row[winner_col]).strip() if winner_col else ""
-
-                if m_label in overrides:
-                    w = overrides[m_label]["winner"]
-                elif w not in ["Red", "Blue", "Tie"]:
-                    w = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
-
-                losing_score = int(min(r_sc, b_sc))
-                if w == "Red":
-                    for t in r_teams:
-                        if t in stats: stats[t]["Wins"] += 1; stats[t]["WP"] += 2; stats[t]["SP"] += losing_score
-                    for t in b_teams:
-                        if t in stats: stats[t]["Losses"] += 1; stats[t]["SP"] += losing_score
-                elif w == "Blue":
-                    for t in b_teams:
-                        if t in stats: stats[t]["Wins"] += 1; stats[t]["WP"] += 2; stats[t]["SP"] += losing_score
-                    for t in r_teams:
-                        if t in stats: stats[t]["Losses"] += 1; stats[t]["SP"] += losing_score
-                else:
-                    for t in r_teams + b_teams:
-                        if t in stats: stats[t]["Ties"] += 1; stats[t]["WP"] += 1; stats[t]["SP"] += losing_score
-
-            df_ranks = pd.DataFrame([{"Team": t, **s} for t, s in stats.items()])
-            df_ranks = df_ranks.sort_values(by=["WP", "SP"], ascending=[False, False]).reset_index(drop=True)
-            df_ranks["Actual_Rank"] = df_ranks.index + 1
-
-        rank_map = {row["Team"]: row["Actual_Rank"] for _, row in df_ranks.iterrows()}
-        carry_sums = {t: 0.0 for t in all_teams}
-        teammates = {t: [] for t in all_teams}
-        opponents = {t: [] for t in all_teams}
-        audit_rows = []
-
-        for _, row in qual_df.iterrows():
-            m_label = str(row[match_col]).strip()
-            r1, r2 = str(row[r1_col]).strip(), str(row[r2_col]).strip()
-            b1, b2 = str(row[b1_col]).strip(), str(row[b2_col]).strip()
-            r_sc = float(row[r_score_col])
-            b_sc = float(row[b_score_col])
-            w = str(row[winner_col]).strip() if winner_col else ""
-
-            if m_label.lower() in overrides:
-                w = overrides[m_label.lower()]["winner"]
-            elif w not in ["Red", "Blue", "Tie"]:
-                w = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
-
-            if r1 in rank_map and r2 in rank_map and b1 in rank_map and b2 in rank_map:
-                for t, p in [(r1, r2), (r2, r1)]:
-                    teammates[t].append(rank_map[p])
-                    opponents[t].extend([rank_map[b1], rank_map[b2]])
-                    delta_r = ((rank_map[t] + rank_map[p]) / 2.0) - ((rank_map[b1] + rank_map[b2]) / 2.0)
-                    base = (rank_map[p] - rank_map[t]) + 2.0 * max(0.0, delta_r)
-                    if w == "Red":
-                        carry = base * 1.0
-                    elif w == "Tie":
-                        carry = base * 0.5
-                    else:
-                        w_m = -0.25 * max(0.0, 1.0 - (r_sc / max(b_sc, 1.0)))
-                        carry = -abs(base) * abs(w_m) if base > 0 else base * (1.0 - abs(w_m))
-                    carry_sums[t] += carry
-                    audit_rows.append({"Match": m_label, "Team": t, "Alliance": "Red", "Partner": p, "Opponents": f"{b1}, {b2}", "Score": f"{int(r_sc)}-{int(b_sc)}", "Result": "Win" if w=="Red" else ("Tie" if w=="Tie" else "Loss"), "Leverage": round(carry, 2)})
-
-            if b1 in rank_map and b2 in rank_map and r1 in rank_map and r2 in rank_map:
-                for t, p in [(b1, b2), (b2, b1)]:
-                    teammates[t].append(rank_map[p])
-                    opponents[t].extend([rank_map[r1], rank_map[r2]])
-                    delta_r = ((rank_map[t] + rank_map[p]) / 2.0) - ((rank_map[r1] + rank_map[r2]) / 2.0)
-                    base = (rank_map[p] - rank_map[t]) + 2.0 * max(0.0, delta_r)
-                    if w == "Blue":
-                        carry = base * 1.0
-                    elif w == "Tie":
-                        carry = base * 0.5
-                    else:
-                        w_m = -0.25 * max(0.0, 1.0 - (b_sc / max(r_sc, 1.0)))
-                        carry = -abs(base) * abs(w_m) if base > 0 else base * (1.0 - abs(w_m))
-                    carry_sums[t] += carry
-                    audit_rows.append({"Match": m_label, "Team": t, "Alliance": "Blue", "Partner": p, "Opponents": f"{r1}, {r2}", "Score": f"{int(b_sc)}-{int(r_sc)}", "Result": "Win" if w=="Blue" else ("Tie" if w=="Tie" else "Loss"), "Leverage": round(carry, 2)})
-
-        num_teams = len(all_teams)
-        median_rank = (num_teams + 1) / 2.0
-        c_vals = list(carry_sums.values())
-        mu = np.mean(c_vals) if c_vals else 0.0
-        sigma = np.std(c_vals, ddof=1) if len(c_vals) > 1 and np.std(c_vals, ddof=1) > 0 else 1.0
-
-        df_ranks["Avg_Teammate_Rank"] = df_ranks["Team"].map(lambda t: round(np.mean(teammates[t]), 2) if t in teammates and teammates[t] else median_rank)
-        df_ranks["Avg_Opponent_Rank"] = df_ranks["Team"].map(lambda t: round(np.mean(opponents[t]), 2) if t in opponents and opponents[t] else median_rank)
-        df_ranks["Schedule_Advantage"] = np.round(df_ranks["Avg_Opponent_Rank"] - df_ranks["Avg_Teammate_Rank"], 2)
-        df_ranks["SOS_Rank"] = df_ranks["Schedule_Advantage"].rank(ascending=True, method="min").astype(int)
-        df_ranks["Carry_Factor"] = df_ranks["Team"].map(lambda t: round(50.0 + 50.0 * ((carry_sums.get(t, 0.0) - mu) / (3.0 * sigma)), 1))
-
-        intercept = median_rank + (0.6282 * 50.0)
-        std_adv = df_ranks["Schedule_Advantage"].std()
-        z_sched = (df_ranks["Schedule_Advantage"] - df_ranks["Schedule_Advantage"].mean()) / (std_adv if std_adv and std_adv > 0 else 1.0)
-        exp_rank = -0.6282 * df_ranks["Carry_Factor"] + intercept
-        surplus = exp_rank - df_ranks["Actual_Rank"]
-        std_surp = surplus.std()
-        z_surp = (surplus - surplus.mean()) / (std_surp if std_surp and std_surp > 0 else 1.0)
-        comp_z = 0.5 * z_sched + 0.5 * z_surp
-        std_comp = comp_z.std()
-        df_ranks["Lucky_Factor"] = np.round(50.0 + 50.0 * (comp_z / (3.0 * (std_comp if std_comp and std_comp > 0 else 1.0))), 1)
-
-        col_order = ["Actual_Rank", "Team"]
-        for c in ["WP", "AP", "SP", "Wins", "Losses", "Ties"]:
-            if c in df_ranks.columns: col_order.append(c)
-        col_order += ["Avg_Teammate_Rank", "Avg_Opponent_Rank", "Schedule_Advantage", "SOS_Rank", "Carry_Factor", "Lucky_Factor"]
-        
-        return df_ranks[[c for c in col_order if c in df_ranks.columns]].sort_values("Actual_Rank").reset_index(drop=True), pd.DataFrame(audit_rows)
-
     df_results = None
     df_audit = None
 
     if selected_archive != "-- Upload New Event Below --":
         archive_path = os.path.join(TOURNAMENTS_DIR, selected_archive)
-        df_results = pd.read_csv(archive_path)
+        with st.spinner(f"Loading {selected_archive}..."):
+            df_results = load_tournament_file(archive_path)
         st.info(f"Loaded tournament archive: **{selected_archive}**")
     elif uploaded_matches is not None:
         with st.spinner("Processing Tournament Data..."):
@@ -282,7 +318,6 @@ if app_mode == "📊 TM Event Analyzer & Archive":
         st.subheader("Tournament Advanced Metrics Board")
         st.dataframe(df_results, use_container_width=True)
 
-        # Archival and Download Buttons
         b_col1, b_col2 = st.columns([1, 1])
         with b_col1:
             csv_data = df_results.to_csv(index=False).encode("utf-8")
@@ -290,7 +325,7 @@ if app_mode == "📊 TM Event Analyzer & Archive":
         
         with b_col2:
             if selected_archive == "-- Upload New Event Below --":
-                event_name = st.text_input("Archive Event Name (e.g. 2026-10-31_Marion_Harding):", value=f"Event_{datetime.now().strftime('%Y%m%d_%H%M')}")
+                event_name = st.text_input("Archive Event Name:", value=f"Event_{datetime.now().strftime('%Y%m%d_%H%M')}")
                 if st.button("💾 Save Event to Tournament Archive"):
                     save_path = os.path.join(TOURNAMENTS_DIR, f"{event_name.strip()}.csv")
                     df_results.to_csv(save_path, index=False)
@@ -306,13 +341,10 @@ elif app_mode == "🗳️ Top 25 Poll & Community Rankings":
 
     tab_ballot, tab_consensus, tab_dossier = st.tabs(["✍️ Submit Top 25 Ballot", "🏆 Consensus Power Rankings", "🔎 Team Season Resumes"])
 
-    # Load cumulative team records from all saved tournament files
     df_global = load_all_archived_teams()
     known_teams = sorted(df_global["Team"].unique().tolist()) if not df_global.empty else []
 
-    # ----------------------------------------------------
     # TAB 1: SUBMIT BALLOT
-    # ----------------------------------------------------
     with tab_ballot:
         st.markdown("### 📋 Official Top 25 Ballot")
         voter_name = st.text_input("Voter Name / Handle:", placeholder="e.g. BuckeyeScout / Coach Smith")
@@ -320,11 +352,9 @@ elif app_mode == "🗳️ Top 25 Poll & Community Rankings":
 
         st.caption("Select your ranked 1 to 25 teams. Each team must be unique.")
 
-        # If no tournament archives exist, allow entering team numbers freely
         ballot_choices = {}
         cols = st.columns(2)
         
-        # Populate 25 selection inputs
         for r in range(1, 26):
             target_col = cols[0] if r <= 13 else cols[1]
             with target_col:
@@ -338,10 +368,8 @@ elif app_mode == "🗳️ Top 25 Poll & Community Rankings":
                     if val.strip():
                         ballot_choices[r] = val.strip().upper()
 
-        # Validate Ballot
         picked_teams = list(ballot_choices.values())
         duplicates = [t for t in set(picked_teams) if picked_teams.count(t) > 1]
-        
         submit_disabled = bool(duplicates) or (len(picked_teams) < 25) or (not voter_name.strip())
 
         if duplicates:
@@ -367,18 +395,15 @@ elif app_mode == "🗳️ Top 25 Poll & Community Rankings":
             st.success("✅ Ballot submitted successfully and factored into the consensus rankings!")
             st.rerun()
 
-    # ----------------------------------------------------
-    # TAB 2: CONSENSUS POWER RANKINGS (BORDA COUNT)
-    # ----------------------------------------------------
+    # TAB 2: CONSENSUS POWER RANKINGS
     with tab_consensus:
         st.markdown("### 🏆 Community Consensus Top 25 Leaderboard")
-        st.caption("Points: #1 = 25 pts, #2 = 24 pts, down to #25 = 1 pt.")
+        st.caption("Borda Count Scoring: #1 = 25 pts, #2 = 24 pts, down to #25 = 1 pt.")
 
         if os.path.exists(BALLOTS_FILE) and os.path.getsize(BALLOTS_FILE) > 0:
             df_ballots = pd.read_csv(BALLOTS_FILE)
             st.metric("Total Ballots Submitted", len(df_ballots))
 
-            # Calculate Borda count points
             borda_scores = {}
             ballot_counts = {}
             ranks_list = {}
@@ -414,11 +439,9 @@ elif app_mode == "🗳️ Top 25 Poll & Community Rankings":
             with st.expander("🗳️ View All Submitted Ballots"):
                 st.dataframe(df_ballots, use_container_width=True)
         else:
-            st.info("No ballots submitted yet. Be the first to submit a ballot in the 'Submit Top 25 Ballot' tab!")
+            st.info("No ballots submitted yet. Submit the first ballot in the 'Submit Top 25 Ballot' tab!")
 
-    # ----------------------------------------------------
     # TAB 3: TEAM DOSSIER LOOKUP
-    # ----------------------------------------------------
     with tab_dossier:
         st.markdown("### 🔎 Season Team Dossiers & Performance History")
         if not df_global.empty:
@@ -436,7 +459,7 @@ elif app_mode == "🗳️ Top 25 Poll & Community Rankings":
             display_cols = [c for c in ["Tournament", "Actual_Rank", "WP", "AP", "SP", "Carry_Factor", "SOS_Rank", "Lucky_Factor"] if c in team_records.columns]
             st.dataframe(team_records[display_cols].reset_index(drop=True), use_container_width=True)
         else:
-            st.info("No tournament archives found. Save an analyzed tournament in Mode 1 to begin building season team dossiers.")
+            st.info("No tournament archives found. Add `.xls`, `.xlsx`, or `.csv` files to `data/tournaments/` or save an event in Mode 1.")
 
 # ==============================================================================
 # MODE 3: FUTURE TOURNAMENT SANDBOX
@@ -503,7 +526,7 @@ elif app_mode == "🔮 Future Tournament Sandbox":
     tot_ap = int(pred_data["AP"].sum())
     ap_unit = target_matches * 6
 
-    # Validation Checks
+    # Real-time V5RC tournament constraints
     validation_errors = []
     if tot_wins != tot_losses:
         validation_errors.append(f"❌ **Wins/Losses Imbalance:** Total Wins ({tot_wins}) does not equal Total Losses ({tot_losses}).")
