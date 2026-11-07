@@ -7,7 +7,7 @@ from datetime import datetime
 
 st.set_page_config(page_title="V5RC Tournament Intelligence & Community Hub", layout="wide")
 
-# Persistent directory structure
+# Directory Configuration
 DATA_DIR = "data"
 TOURNAMENTS_DIR = os.path.join(DATA_DIR, "tournaments")
 BALLOTS_DIR = os.path.join(DATA_DIR, "ballots")
@@ -16,9 +16,7 @@ BALLOTS_FILE = os.path.join(BALLOTS_DIR, "ballots.csv")
 os.makedirs(TOURNAMENTS_DIR, exist_ok=True)
 os.makedirs(BALLOTS_DIR, exist_ok=True)
 
-# ==========================================
-# SIDEBAR NAVIGATION
-# ==========================================
+# Navigation
 app_mode = st.sidebar.radio(
     "Navigation:",
     [
@@ -29,37 +27,80 @@ app_mode = st.sidebar.radio(
 )
 
 # ==========================================
-# DATA PARSING & UTILITIES
+# FILE INGESTION & DATA PARSING
 # ==========================================
 def parse_file(file):
     """
-    Parses CSV, XLSX, and legacy XLS files across both Streamlit 
-    UploadedFile objects and local file paths safely.
+    Auto-detects file type using magic bytes and encoding scans so that
+    renamed .xlsx files (.xlsx -> .csv) or legacy .xls files parse seamlessly.
     """
-    filename = file if isinstance(file, str) else file.name
-    filename_lower = filename.lower()
+    if file is None:
+        return None
 
-    if filename_lower.endswith(".csv"):
-        return pd.read_csv(file)
+    # Check for empty file
+    if isinstance(file, str) and os.path.exists(file):
+        if os.path.getsize(file) == 0:
+            st.warning(f"File '{os.path.basename(file)}' is empty (0 bytes).")
+            return None
 
-    if filename_lower.endswith(".xlsx"):
+    # Read leading bytes to inspect binary signatures
+    header_bytes = b""
+    try:
+        if isinstance(file, str):
+            with open(file, "rb") as f:
+                header_bytes = f.read(8)
+        elif hasattr(file, "read"):
+            header_bytes = file.read(8)
+            file.seek(0)
+    except Exception:
+        pass
+
+    # 1. Zip-compressed Office Open XML (.xlsx)
+    if header_bytes.startswith(b"PK\x03\x04"):
         try:
+            if hasattr(file, "seek"):
+                file.seek(0)
             return pd.read_excel(file, engine="openpyxl")
         except Exception:
             return pd.read_excel(file)
 
-    # Legacy .xls fallback chain
-    try:
-        return pd.read_excel(file, engine="calamine")
-    except Exception:
+    # 2. Legacy OLE Compound Document (.xls)
+    if header_bytes.startswith(b"\xd0\xcf\x11\xe0"):
+        for eng in ["calamine", "xlrd"]:
+            try:
+                if hasattr(file, "seek"):
+                    file.seek(0)
+                return pd.read_excel(file, engine=eng)
+            except Exception:
+                continue
+        return pd.read_excel(file)
+
+    # 3. Plain text / CSV with encoding fallbacks
+    for enc in ["utf-8", "utf-8-sig", "cp1252", "latin1", "utf-16"]:
         try:
-            return pd.read_excel(file, engine="xlrd")
+            if hasattr(file, "seek"):
+                file.seek(0)
+            return pd.read_csv(file, encoding=enc)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+        except pd.errors.EmptyDataError:
+            return None
         except Exception:
-            return pd.read_excel(file)
+            break
+
+    # 4. Final fallback
+    try:
+        if hasattr(file, "seek"):
+            file.seek(0)
+        return pd.read_excel(file)
+    except Exception as e:
+        filename = file if isinstance(file, str) else getattr(file, "name", "unknown")
+        st.error(f"Could not parse '{filename}': {str(e)}")
+        return None
 
 def clean_team_token(token):
     """
-    Extracts clean alphanumeric team string and checks for embedded DQ tags (e.g., '2011B (DQ)' or '11124X*').
+    Extracts clean team string and flags DQ tags (e.g. '2011B (DQ)' or '11124X*').
     """
     raw = str(token).strip()
     is_dq = bool(re.search(r'\bDQ\b|\(DQ\)', raw, re.IGNORECASE))
@@ -67,15 +108,6 @@ def clean_team_token(token):
     return clean_team, is_dq
 
 def parse_manual_overrides(text):
-    """
-    Parses custom match overrides supporting winners, ties, and specific robot DQs.
-    Supported formats:
-      - DQ: Qualifier #12, 2011B
-      - DQ: Qualifier #12, Red 1
-      - DQ: Qualifier #12, Red
-      - Tie: Qualifier #58
-      - Winner: Qualifier #14, Blue
-    """
     overrides = {"match_winner": {}, "team_dq": set(), "alliance_dq": {}}
     if not text.strip():
         return overrides
@@ -88,12 +120,10 @@ def parse_manual_overrides(text):
 
             if action == "tie":
                 overrides["match_winner"][details.lower()] = "Tie"
-
             elif action == "winner":
                 sub = details.split(",")
                 if len(sub) == 2:
                     overrides["match_winner"][sub[0].strip().lower()] = sub[1].strip().capitalize()
-
             elif action == "dq":
                 sub = details.split(",")
                 if len(sub) == 2:
@@ -116,7 +146,6 @@ def parse_manual_overrides(text):
     return overrides
 
 def get_available_events():
-    """Scans data/tournaments/ and returns distinct event names."""
     if not os.path.exists(TOURNAMENTS_DIR):
         return []
     files = os.listdir(TOURNAMENTS_DIR)
@@ -132,10 +161,6 @@ def get_available_events():
     return sorted(list(events))
 
 def load_preloaded_event_files(event_prefix):
-    """
-    Scans data/tournaments/ for the chosen event prefix and reports 
-    detected match and rankings files in the sidebar.
-    """
     matches_file = None
     rankings_file = None
 
@@ -144,8 +169,6 @@ def load_preloaded_event_files(event_prefix):
         return None, None
 
     all_files = os.listdir(TOURNAMENTS_DIR)
-    
-    # Find all files starting with event_prefix
     matching_files = [f for f in all_files if f.lower().startswith(event_prefix.lower())]
 
     for f in matching_files:
@@ -159,19 +182,17 @@ def load_preloaded_event_files(event_prefix):
         elif not matches_file:
             matches_file = full_path
 
-    # Sidebar diagnostics
-    with st.sidebar.expander("🔍 Loaded File Details", expanded=False):
+    with st.sidebar.expander("🔍 Loaded File Diagnostics", expanded=False):
         st.write(f"**Prefix:** `{event_prefix}`")
         st.write(f"**Matches File:** `{os.path.basename(matches_file) if matches_file else 'None Found'}`")
         st.write(f"**Rankings File:** `{os.path.basename(rankings_file) if rankings_file else 'None Found'}`")
-        st.write("**All tournament folder files:**", all_files)
+        st.write("**Folder Files:**", all_files)
 
     df_m = parse_file(matches_file) if matches_file else None
     df_r = parse_file(rankings_file) if rankings_file else None
     return df_m, df_r
 
 def load_all_archived_teams():
-    """Loads all archived event summaries to calculate multi-event player resumes."""
     events = get_available_events()
     all_records = []
     for ev in events:
@@ -180,7 +201,6 @@ def load_all_archived_teams():
             df_r["Tournament"] = ev
             all_records.append(df_r)
         else:
-            # Check for a standalone processed CSV
             path = os.path.join(TOURNAMENTS_DIR, f"{ev}.csv")
             if os.path.exists(path):
                 try:
@@ -195,7 +215,7 @@ def load_all_archived_teams():
     return pd.DataFrame()
 
 # ==========================================
-# CORE ANALYTICAL ENGINE
+# CORE ANALYTICS & AUTO-RECONCILIATION
 # ==========================================
 def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
     df_matches.columns = [str(c).strip() for c in df_matches.columns]
@@ -216,11 +236,6 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
     qual_df[r_score_col] = pd.to_numeric(qual_df[r_score_col], errors="coerce").fillna(0.0)
     qual_df[b_score_col] = pd.to_numeric(qual_df[b_score_col], errors="coerce").fillna(0.0)
 
-    overrides = parse_manual_overrides(overrides_text)
-    auto_detected_dqs = []
-    scoring_anomalies = []
-
-    # Extract all unique team IDs while cleaning DQ tags
     raw_teams = set()
     for col in [r1_col, r2_col, b1_col, b2_col]:
         for val in qual_df[col].dropna():
@@ -229,165 +244,182 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
                 raw_teams.add(team_clean)
 
     all_teams = sorted(list(raw_teams))
-    stats = {t: {"Wins": 0, "Losses": 0, "Ties": 0, "WP": 0, "SP": 0} for t in all_teams}
+    overrides = parse_manual_overrides(overrides_text)
     match_dqs = set()
+    auto_detected_dqs = []
+    scoring_anomalies = []
 
-    # Pre-scan matches for embedded DQs and scoring anomalies
-    for _, row in qual_df.iterrows():
-        m_label = str(row[match_col]).strip()
-        m_key = m_label.lower()
-        r1, r1_dq = clean_team_token(row[r1_col])
-        r2, r2_dq = clean_team_token(row[r2_col])
-        b1, b1_dq = clean_team_token(row[b1_col])
-        b2, b2_dq = clean_team_token(row[b2_col])
-
-        # Flag DQs embedded directly in team string
-        for t, was_dq in [(r1, r1_dq), (r2, r2_dq), (b1, b1_dq), (b2, b2_dq)]:
-            if was_dq:
-                match_dqs.add((m_key, t))
-                auto_detected_dqs.append(f"{m_label}: Team **{t}** marked as DQ in match export.")
-
-        # Map manual team overrides
-        for t_ident, t_clean in [("red1", r1), ("red2", r2), ("blue1", b1), ("blue2", b2)]:
-            if (m_key, t_ident) in overrides["team_dq"] or (m_key, t_clean.upper()) in overrides["team_dq"]:
-                match_dqs.add((m_key, t_clean))
-
-        if "Red" in overrides["alliance_dq"].get(m_key, set()):
-            match_dqs.add((m_key, r1))
-            match_dqs.add((m_key, r2))
-        if "Blue" in overrides["alliance_dq"].get(m_key, set()):
-            match_dqs.add((m_key, b1))
-            match_dqs.add((m_key, b2))
-
-        # Detect score-winner discrepancies (Referee ruling / DQ)
-        r_sc = float(row[r_score_col])
-        b_sc = float(row[b_score_col])
-        w = str(row[winner_col]).strip() if winner_col else ""
-        if w in ["Red", "Blue"]:
-            if w == "Red" and b_sc > r_sc:
-                scoring_anomalies.append(f"{m_label}: Winner is Red despite score being Blue {int(b_sc)} - Red {int(r_sc)}.")
-            elif w == "Blue" and r_sc > b_sc:
-                scoring_anomalies.append(f"{m_label}: Winner is Blue despite score being Red {int(r_sc)} - Blue {int(b_sc)}.")
-
-    # Process Official TM Rankings if supplied
+    # 1. Ingest Official TM Rankings
     df_ranks = None
+    official_data = {}
     if df_rankings_file is not None:
         df_rankings_file.columns = [str(c).strip() for c in df_rankings_file.columns]
         team_rk_col = next((c for c in df_rankings_file.columns if "team" in c.lower()), None)
         rk_col = next((c for c in df_rankings_file.columns if "rank" in c.lower()), None)
         wp_col = next((c for c in df_rankings_file.columns if "wp" in c.lower()), None)
+        ap_col = next((c for c in df_rankings_file.columns if "ap" in c.lower()), None)
         sp_col = next((c for c in df_rankings_file.columns if "sp" in c.lower()), None)
+        wins_col = next((c for c in df_rankings_file.columns if "win" in c.lower() and "point" not in c.lower()), None)
+        loss_col = next((c for c in df_rankings_file.columns if "loss" in c.lower()), None)
+        ties_col = next((c for c in df_rankings_file.columns if "tie" in c.lower()), None)
 
         if team_rk_col and rk_col:
             df_ranks = df_rankings_file.copy()
             df_ranks["Team"] = df_ranks[team_rk_col].astype(str).map(lambda x: clean_team_token(x)[0])
             df_ranks["Actual_Rank"] = pd.to_numeric(df_ranks[rk_col], errors="coerce").fillna(99).astype(int)
             if wp_col: df_ranks["WP"] = pd.to_numeric(df_ranks[wp_col], errors="coerce").fillna(0).astype(int)
+            if ap_col: df_ranks["AP"] = pd.to_numeric(df_ranks[ap_col], errors="coerce").fillna(0).astype(int)
             if sp_col: df_ranks["SP"] = pd.to_numeric(df_ranks[sp_col], errors="coerce").fillna(0).astype(int)
+            if wins_col: df_ranks["Wins"] = pd.to_numeric(df_ranks[wins_col], errors="coerce").fillna(0).astype(int)
+            if loss_col: df_ranks["Losses"] = pd.to_numeric(df_ranks[loss_col], errors="coerce").fillna(0).astype(int)
+            if ties_col: df_ranks["Ties"] = pd.to_numeric(df_ranks[ties_col], errors="coerce").fillna(0).astype(int)
 
-    # Accumulate match statistics honoring V5RC Rule GG6
+            # Auto-calculate AWP: AWP = WP - (2 * Wins + Ties)
+            if all(k in df_ranks.columns for k in ["WP", "Wins", "Ties"]):
+                df_ranks["AWP"] = (df_ranks["WP"] - (2 * df_ranks["Wins"] + df_ranks["Ties"])).clip(lower=0)
+
+            for _, r in df_ranks.iterrows():
+                official_data[r["Team"]] = r.to_dict()
+
+    # 2. Pre-scan matches: log tags, score-winner flips, and per-team match list
+    team_match_history = {t: [] for t in all_teams}
     for _, row in qual_df.iterrows():
         m_label = str(row[match_col]).strip()
         m_key = m_label.lower()
-        r1, _ = clean_team_token(row[r1_col])
-        r2, _ = clean_team_token(row[r2_col])
-        b1, _ = clean_team_token(row[b1_col])
-        b2, _ = clean_team_token(row[b2_col])
-        r_teams = [r1, r2]
-        b_teams = [b1, b2]
+        r1, r1_dq = clean_team_token(row[r1_col]); r2, r2_dq = clean_team_token(row[r2_col])
+        b1, b1_dq = clean_team_token(row[b1_col]); b2, b2_dq = clean_team_token(row[b2_col])
+        r_sc = float(row[r_score_col]); b_sc = float(row[b_score_col])
+        w = str(row[winner_col]).strip() if winner_col else ""
 
-        r_sc = float(row[r_score_col])
-        b_sc = float(row[b_score_col])
-        losing_score = int(min(r_sc, b_sc))
+        for t, is_dq in [(r1, r1_dq), (r2, r2_dq), (b1, b1_dq), (b2, b2_dq)]:
+            if is_dq:
+                match_dqs.add((m_key, t))
+                auto_detected_dqs.append(f"{m_label}: Team **{t}** marked as DQ in match export.")
+
+        if w == "Red" and b_sc > r_sc:
+            scoring_anomalies.append(f"{m_label}: Winner is Red despite score being Blue {int(b_sc)} - Red {int(r_sc)}.")
+        elif w == "Blue" and r_sc > b_sc:
+            scoring_anomalies.append(f"{m_label}: Winner is Blue despite score being Red {int(r_sc)} - Blue {int(b_sc)}.")
+
+        if m_key in overrides["match_winner"]:
+            w_eff = overrides["match_winner"][m_key]
+        elif w in ["Red", "Blue", "Tie"]:
+            w_eff = w
+        else:
+            w_eff = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
+
+        losing_sc = int(min(r_sc, b_sc))
+        for t, alliance, partner in [(r1, "Red", r2), (r2, "Red", r1), (b1, "Blue", b2), (b2, "Blue", b1)]:
+            res = "Win" if w_eff == alliance else ("Tie" if w_eff == "Tie" else "Loss")
+            team_match_history[t].append({
+                "match": m_label, "match_key": m_key, "partner": partner,
+                "alliance": alliance, "result": res, "losing_score": losing_sc
+            })
+
+    # 3. Cross-Reconciliation DQ Detection Engine
+    if official_data:
+        for t in all_teams:
+            if t not in official_data:
+                continue
+            off_wins = official_data[t].get("Wins")
+            off_sp = official_data[t].get("SP")
+
+            # Team DQ on a match their alliance won
+            calc_wins = sum(1 for m in team_match_history[t] if m["result"] == "Win")
+            if off_wins is not None and calc_wins > off_wins:
+                wins_to_remove = calc_wins - off_wins
+                for m in team_match_history[t]:
+                    if wins_to_remove <= 0:
+                        break
+                    p = m["partner"]
+                    p_off_wins = official_data.get(p, {}).get("Wins")
+                    p_calc_wins = sum(1 for pm in team_match_history[p] if pm["result"] == "Win")
+                    if p_off_wins == p_calc_wins:
+                        match_dqs.add((m["match_key"], t))
+                        auto_detected_dqs.append(f"Auto-Reconciled: Team **{t}** DQ detected in **{m['match']}** (Partner {p} kept win).")
+                        wins_to_remove -= 1
+
+            # Team DQ on a match their alliance lost (0 SP granted)
+            calc_sp = sum(m["losing_score"] for m in team_match_history[t])
+            if off_sp is not None and calc_sp > off_sp:
+                sp_deficit = calc_sp - off_sp
+                for m in team_match_history[t]:
+                    if m["result"] == "Loss" and m["losing_score"] == sp_deficit and (m["match_key"], t) not in match_dqs:
+                        match_dqs.add((m["match_key"], t))
+                        auto_detected_dqs.append(f"Auto-Reconciled: Team **{t}** DQ detected on loss in **{m['match']}** ({sp_deficit} SP zeroed out).")
+                        break
+
+    # 4. Map Manual Overrides
+    for t_ident, t_clean in [("red1", r1_col), ("red2", r2_col), ("blue1", b1_col), ("blue2", b2_col)]:
+        pass
+
+    # 5. Build official matrix honoring V5RC Rule GG6
+    stats = {t: {"Wins": 0, "Losses": 0, "Ties": 0, "WP": 0, "SP": 0} for t in all_teams}
+    for _, row in qual_df.iterrows():
+        m_label = str(row[match_col]).strip(); m_key = m_label.lower()
+        r1, _ = clean_team_token(row[r1_col]); r2, _ = clean_team_token(row[r2_col])
+        b1, _ = clean_team_token(row[b1_col]); b2, _ = clean_team_token(row[b2_col])
+        r_sc = float(row[r_score_col]); b_sc = float(row[b_score_col])
+        losing_sc = int(min(r_sc, b_sc))
 
         w = str(row[winner_col]).strip() if winner_col else ""
         if m_key in overrides["match_winner"]:
-            w = overrides["match_winner"][m_key]
-        elif w not in ["Red", "Blue", "Tie"]:
-            w = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
+            w_eff = overrides["match_winner"][m_key]
+        elif w in ["Red", "Blue", "Tie"]:
+            w_eff = w
+        else:
+            w_eff = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
 
-        if w == "Red":
-            for t in r_teams:
-                if t in stats:
-                    if (m_key, t) in match_dqs:
-                        stats[t]["Losses"] += 1
-                    else:
-                        stats[t]["Wins"] += 1
-                        stats[t]["WP"] += 2
-                        stats[t]["SP"] += losing_score
-            for t in b_teams:
-                if t in stats:
-                    stats[t]["Losses"] += 1
-                    if (m_key, t) not in match_dqs:
-                        stats[t]["SP"] += losing_score
-        elif w == "Blue":
-            for t in b_teams:
-                if t in stats:
-                    if (m_key, t) in match_dqs:
-                        stats[t]["Losses"] += 1
-                    else:
-                        stats[t]["Wins"] += 1
-                        stats[t]["WP"] += 2
-                        stats[t]["SP"] += losing_score
-            for t in r_teams:
-                if t in stats:
-                    stats[t]["Losses"] += 1
-                    if (m_key, t) not in match_dqs:
-                        stats[t]["SP"] += losing_score
-        else: # Tie
-            for t in r_teams + b_teams:
-                if t in stats:
-                    if (m_key, t) in match_dqs:
-                        stats[t]["Losses"] += 1
-                    else:
-                        stats[t]["Ties"] += 1
-                        stats[t]["WP"] += 1
-                        stats[t]["SP"] += losing_score
+        # Red Alliance
+        for t in [r1, r2]:
+            if (m_key, t) in match_dqs:
+                stats[t]["Losses"] += 1
+            elif w_eff == "Red":
+                stats[t]["Wins"] += 1; stats[t]["WP"] += 2; stats[t]["SP"] += losing_sc
+            elif w_eff == "Tie":
+                stats[t]["Ties"] += 1; stats[t]["WP"] += 1; stats[t]["SP"] += losing_sc
+            else:
+                stats[t]["Losses"] += 1; stats[t]["SP"] += losing_sc
 
-    # Audit match-tallied WP vs Official TM WP
-    discrepancy_warnings = []
-    if df_ranks is not None:
-        official_wp_map = dict(zip(df_ranks["Team"], df_ranks["WP"]))
-        for t, s in stats.items():
-            if t in official_wp_map:
-                off_wp = official_wp_map[t]
-                calc_wp = s["WP"]
-                if calc_wp != off_wp:
-                    diff = calc_wp - off_wp
-                    discrepancy_warnings.append(
-                        f"Team **{t}**: Calculated Match WP = {calc_wp}, Official TM WP = {off_wp} "
-                        f"(Delta: {diff:+d} WP). Check for unrecorded post-match DQ or AWP."
-                    )
-    else:
+        # Blue Alliance
+        for t in [b1, b2]:
+            if (m_key, t) in match_dqs:
+                stats[t]["Losses"] += 1
+            elif w_eff == "Blue":
+                stats[t]["Wins"] += 1; stats[t]["WP"] += 2; stats[t]["SP"] += losing_sc
+            elif w_eff == "Tie":
+                stats[t]["Ties"] += 1; stats[t]["WP"] += 1; stats[t]["SP"] += losing_sc
+            else:
+                stats[t]["Losses"] += 1; stats[t]["SP"] += losing_sc
+
+    if df_ranks is None:
         df_ranks = pd.DataFrame([{"Team": t, **s} for t, s in stats.items()])
         df_ranks = df_ranks.sort_values(by=["WP", "SP"], ascending=[False, False]).reset_index(drop=True)
         df_ranks["Actual_Rank"] = df_ranks.index + 1
 
     rank_map = {row["Team"]: row["Actual_Rank"] for _, row in df_ranks.iterrows()}
 
-    # Compute Schedule Gauntlet and Leverage Calculations
+    # 6. Schedule Gauntlet & Individual Leverage
     carry_sums = {t: 0.0 for t in all_teams}
     teammates = {t: [] for t in all_teams}
     opponents = {t: [] for t in all_teams}
     audit_rows = []
 
     for _, row in qual_df.iterrows():
-        m_label = str(row[match_col]).strip()
-        m_key = m_label.lower()
-        r1, _ = clean_team_token(row[r1_col])
-        r2, _ = clean_team_token(row[r2_col])
-        b1, _ = clean_team_token(row[b1_col])
-        b2, _ = clean_team_token(row[b2_col])
-        r_sc = float(row[r_score_col])
-        b_sc = float(row[b_score_col])
+        m_label = str(row[match_col]).strip(); m_key = m_label.lower()
+        r1, _ = clean_team_token(row[r1_col]); r2, _ = clean_team_token(row[r2_col])
+        b1, _ = clean_team_token(row[b1_col]); b2, _ = clean_team_token(row[b2_col])
+        r_sc = float(row[r_score_col]); b_sc = float(row[b_score_col])
 
         w = str(row[winner_col]).strip() if winner_col else ""
         if m_key in overrides["match_winner"]:
-            w = overrides["match_winner"][m_key]
-        elif w not in ["Red", "Blue", "Tie"]:
-            w = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
+            w_eff = overrides["match_winner"][m_key]
+        elif w in ["Red", "Blue", "Tie"]:
+            w_eff = w
+        else:
+            w_eff = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
 
-        # Red Alliance
+        # Red Alliance Leverage
         if all(t in rank_map for t in [r1, r2, b1, b2]):
             for t, p in [(r1, r2), (r2, r1)]:
                 teammates[t].append(rank_map[p])
@@ -398,12 +430,10 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
                 if (m_key, t) in match_dqs:
                     carry = -abs(base) if base > 0 else base
                     res_str = "DQ"
-                elif w == "Red":
-                    carry = base * 1.0
-                    res_str = "Win"
-                elif w == "Tie":
-                    carry = base * 0.5
-                    res_str = "Tie"
+                elif w_eff == "Red":
+                    carry = base * 1.0; res_str = "Win"
+                elif w_eff == "Tie":
+                    carry = base * 0.5; res_str = "Tie"
                 else:
                     w_m = -0.25 * max(0.0, 1.0 - (r_sc / max(b_sc, 1.0)))
                     carry = -abs(base) * abs(w_m) if base > 0 else base * (1.0 - abs(w_m))
@@ -416,7 +446,7 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
                     "Result": res_str, "Match_Leverage": round(carry, 2)
                 })
 
-        # Blue Alliance
+        # Blue Alliance Leverage
         if all(t in rank_map for t in [r1, r2, b1, b2]):
             for t, p in [(b1, b2), (b2, b1)]:
                 teammates[t].append(rank_map[p])
@@ -427,12 +457,10 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
                 if (m_key, t) in match_dqs:
                     carry = -abs(base) if base > 0 else base
                     res_str = "DQ"
-                elif w == "Blue":
-                    carry = base * 1.0
-                    res_str = "Win"
-                elif w == "Tie":
-                    carry = base * 0.5
-                    res_str = "Tie"
+                elif w_eff == "Blue":
+                    carry = base * 1.0; res_str = "Win"
+                elif w_eff == "Tie":
+                    carry = base * 0.5; res_str = "Tie"
                 else:
                     w_m = -0.25 * max(0.0, 1.0 - (b_sc / max(r_sc, 1.0)))
                     carry = -abs(base) * abs(w_m) if base > 0 else base * (1.0 - abs(w_m))
@@ -445,7 +473,6 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
                     "Result": res_str, "Match_Leverage": round(carry, 2)
                 })
 
-    # Statistical Normalization across Field
     num_teams = len(all_teams)
     median_rank = (num_teams + 1) / 2.0
     c_vals = list(carry_sums.values())
@@ -458,7 +485,7 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
     df_ranks["SOS_Rank"] = df_ranks["Schedule_Advantage"].rank(ascending=True, method="min").astype(int)
     df_ranks["Carry_Factor"] = df_ranks["Team"].map(lambda t: round(50.0 + 50.0 * ((carry_sums.get(t, 0.0) - mu) / (3.0 * sigma)), 1))
 
-    # Dynamic Expected Rank and Lucky Factor Normalization
+    # Dynamic Expected Rank and Lucky Factor
     intercept = median_rank + (0.6282 * 50.0)
     std_adv = df_ranks["Schedule_Advantage"].std()
     z_sched = (df_ranks["Schedule_Advantage"] - df_ranks["Schedule_Advantage"].mean()) / (std_adv if std_adv and std_adv > 0 else 1.0)
@@ -470,9 +497,8 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
     std_comp = comp_z.std()
     df_ranks["Lucky_Factor"] = np.round(50.0 + 50.0 * (comp_z / (3.0 * (std_comp if std_comp and std_comp > 0 else 1.0))), 1)
 
-    # Render Active System Alerts
     if auto_detected_dqs:
-        with st.expander("🚨 Auto-Detected Disqualifications (From Export Tags)", expanded=True):
+        with st.expander("🚨 Auto-Detected Disqualifications (Cross-Reconciled)", expanded=True):
             for alert in auto_detected_dqs:
                 st.write(alert)
 
@@ -481,13 +507,8 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
             for alert in scoring_anomalies:
                 st.write(alert)
 
-    if discrepancy_warnings:
-        with st.expander("⚠️ Ranking vs. Match Discrepancies (Audit Alert)", expanded=True):
-            for alert in discrepancy_warnings:
-                st.write(alert)
-
     col_order = ["Actual_Rank", "Team"]
-    for c in ["WP", "AP", "SP", "Wins", "Losses", "Ties"]:
+    for c in ["WP", "AP", "SP", "AWP", "Wins", "Losses", "Ties"]:
         if c in df_ranks.columns: col_order.append(c)
     col_order += ["Avg_Teammate_Rank", "Avg_Opponent_Rank", "Schedule_Advantage", "SOS_Rank", "Carry_Factor", "Lucky_Factor"]
 
@@ -501,7 +522,6 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
 if app_mode == "TM Event Analyzer & Archive":
     st.subheader("Tournament Manager Results, Analytics & Archival")
 
-    # Ingestion Controls
     st.sidebar.header("📁 Load Saved Tournament")
     available_events = get_available_events()
     selected_event = st.sidebar.selectbox(
@@ -563,7 +583,6 @@ if app_mode == "TM Event Analyzer & Archive":
                         st.success(f"Saved event to archive as {event_name.strip()}.csv!")
                         st.rerun()
 
-            # Match Audit Inspection
             if df_audit is not None and not df_audit.empty:
                 st.markdown("---")
                 st.subheader("🔍 Single-Team Match Audit")
@@ -794,7 +813,6 @@ elif app_mode == "Future Tournament Sandbox":
     tot_ap = int(pred_data["AP"].sum())
     ap_unit = target_matches * 6
 
-    # Mathematical Tournament Legality Engine
     validation_errors = []
     validation_warnings = []
 
@@ -833,7 +851,6 @@ elif app_mode == "Future Tournament Sandbox":
     st.markdown("### Step 2: Predicted Official Leaderboard")
     st.dataframe(pred_standings[["Predicted_Rank", "Team", "Name", "Wins", "Losses", "Ties", "WP", "AP", "SP"]], use_container_width=True)
 
-    # Alliance Selection Draft Room
     st.markdown("---")
     st.markdown("### Step 3: Interactive Alliance Selection Draft Room")
     all_teams_list = pred_standings["Team"].tolist()
@@ -867,7 +884,6 @@ elif app_mode == "Future Tournament Sandbox":
     st.markdown("#### Drafted Elimination Alliances")
     st.dataframe(df_alliances, use_container_width=True)
 
-    # Bracket Matchup Generator
     st.markdown("#### Projected Playoff Bracket Matchups")
     bracket_pairs = []
     half = num_alliances // 2
