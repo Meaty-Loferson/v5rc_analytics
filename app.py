@@ -7,7 +7,7 @@ from datetime import datetime
 
 st.set_page_config(page_title="V5RC Tournament Intelligence & Community Hub", layout="wide")
 
-# Directory Configuration
+# Persistent directory structure
 DATA_DIR = "data"
 TOURNAMENTS_DIR = os.path.join(DATA_DIR, "tournaments")
 BALLOTS_DIR = os.path.join(DATA_DIR, "ballots")
@@ -27,14 +27,12 @@ app_mode = st.sidebar.radio(
     ]
 )
 
+PLAYOFF_ORDER = {"Champion": 1, "Finalist": 2, "SF": 3, "QF": 4, "R16": 5, "Quals": 6, "-": 7}
+
 # ==========================================
 # FILE INGESTION & DATA PARSING
 # ==========================================
 def parse_file(file):
-    """
-    Auto-detects file type using magic bytes and encoding scans so that
-    renamed .xlsx files (.xlsx -> .csv) or legacy .xls files parse seamlessly.
-    """
     if file is None:
         return None
 
@@ -141,6 +139,7 @@ def parse_manual_overrides(text):
     return overrides
 
 def get_available_events():
+    """Returns clean, unique event names without treating component files as distinct events."""
     if not os.path.exists(TOURNAMENTS_DIR):
         return []
     files = os.listdir(TOURNAMENTS_DIR)
@@ -148,11 +147,14 @@ def get_available_events():
     for f in files:
         if f.endswith((".csv", ".xlsx", ".xls")):
             base_name = f.rsplit(".", 1)[0]
-            for suffix in ["_matches", "_rankings", "-matches", "-rankings", "_results"]:
-                if base_name.endswith(suffix):
+            # Strip component suffixes
+            for suffix in ["_matches", "_rankings", "-matches", "-rankings", "_results", "-results"]:
+                if base_name.lower().endswith(suffix):
                     base_name = base_name[:-len(suffix)]
                     break
-            events.add(base_name)
+            # Ignore naked component files
+            if base_name.lower() not in ["matches", "rankings", "results", ""]:
+                events.add(base_name)
     return sorted(list(events))
 
 def load_preloaded_event_files(event_prefix):
@@ -160,7 +162,6 @@ def load_preloaded_event_files(event_prefix):
     rankings_file = None
 
     if not os.path.exists(TOURNAMENTS_DIR):
-        st.sidebar.error("Tournaments directory 'data/tournaments/' not found.")
         return None, None
 
     all_files = os.listdir(TOURNAMENTS_DIR)
@@ -177,9 +178,91 @@ def load_preloaded_event_files(event_prefix):
         elif not matches_file:
             matches_file = full_path
 
+    with st.sidebar.expander("🔍 Loaded File Diagnostics", expanded=False):
+        st.write(f"**Prefix:** `{event_prefix}`")
+        st.write(f"**Matches File:** `{os.path.basename(matches_file) if matches_file else 'None Found'}`")
+        st.write(f"**Rankings File:** `{os.path.basename(rankings_file) if rankings_file else 'None Found'}`")
+
     df_m = parse_file(matches_file) if matches_file else None
     df_r = parse_file(rankings_file) if rankings_file else None
     return df_m, df_r
+
+def extract_playoff_finishes(df_matches, all_teams):
+    """
+    Parses tournament elimination matches to determine each team's deepest
+    playoff finish (Champion, Finalist, SF, QF, R16, or Quals).
+    """
+    match_col = next((c for c in df_matches.columns if "match" in c.lower()), None)
+    r1_col = next((c for c in df_matches.columns if "red" in c.lower() and "1" in c.lower()), None)
+    r2_col = next((c for c in df_matches.columns if "red" in c.lower() and "2" in c.lower()), None)
+    b1_col = next((c for c in df_matches.columns if "blue" in c.lower() and "1" in c.lower()), None)
+    b2_col = next((c for c in df_matches.columns if "blue" in c.lower() and "2" in c.lower()), None)
+    r_score_col = next((c for c in df_matches.columns if "red" in c.lower() and "score" in c.lower()), None)
+    b_score_col = next((c for c in df_matches.columns if "blue" in c.lower() and "score" in c.lower()), None)
+    winner_col = next((c for c in df_matches.columns if "winner" in c.lower()), None)
+
+    finishes = {t: "Quals" for t in all_teams}
+    if not match_col or not all([r1_col, r2_col, b1_col, b2_col]):
+        return finishes
+
+    m_series = df_matches[match_col].astype(str).str.lower().str.strip()
+    elim_mask = ~m_series.str.startswith("qual") & ~m_series.str.startswith("prac")
+    elim_df = df_matches[elim_mask].copy()
+
+    if elim_df.empty:
+        return {t: "-" for t in all_teams}
+
+    finals_winners = set()
+    finals_losers = set()
+    sf_teams = set()
+    qf_teams = set()
+    r16_teams = set()
+
+    for _, row in elim_df.iterrows():
+        m_name = str(row[match_col]).lower().strip()
+        r1, _ = clean_team_token(row[r1_col])
+        r2, _ = clean_team_token(row[r2_col])
+        b1, _ = clean_team_token(row[b1_col])
+        b2, _ = clean_team_token(row[b2_col])
+        r_teams = [r1, r2]
+        b_teams = [b1, b2]
+
+        r_sc = float(row[r_score_col]) if r_score_col and pd.notna(row[r_score_col]) else 0.0
+        b_sc = float(row[b_score_col]) if b_score_col and pd.notna(row[b_score_col]) else 0.0
+        w = str(row[winner_col]).strip().capitalize() if winner_col else ""
+        if w not in ["Red", "Blue"]:
+            w = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
+
+        # Finals
+        if any(k in m_name for k in ["final", "finals"]) and not any(k in m_name for k in ["semi", "quarter"]):
+            if w == "Red":
+                finals_winners.update(r_teams)
+                finals_losers.update(b_teams)
+            elif w == "Blue":
+                finals_winners.update(b_teams)
+                finals_losers.update(r_teams)
+            else:
+                finals_losers.update(r_teams + b_teams)
+        elif any(k in m_name for k in ["semi", "sf"]):
+            sf_teams.update(r_teams + b_teams)
+        elif any(k in m_name for k in ["quarter", "qf"]):
+            qf_teams.update(r_teams + b_teams)
+        elif any(k in m_name for k in ["round of 16", "r16"]):
+            r16_teams.update(r_teams + b_teams)
+
+    for t in all_teams:
+        if t in finals_winners:
+            finishes[t] = "Champion"
+        elif t in finals_losers:
+            finishes[t] = "Finalist"
+        elif t in sf_teams:
+            finishes[t] = "SF"
+        elif t in qf_teams:
+            finishes[t] = "QF"
+        elif t in r16_teams:
+            finishes[t] = "R16"
+
+    return finishes
 
 # ==========================================
 # CORE ANALYTICAL ENGINE
@@ -347,7 +430,7 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
                         )
                         break
 
-    # 4. Build official matrix honoring V5RC Rule GG6
+    # 4. Build official matrix honoring Rule GG6
     stats = {t: {"Wins": 0, "Losses": 0, "Ties": 0, "WP": 0, "SP": 0} for t in all_teams}
     for _, row in qual_df.iterrows():
         m_label = str(row[match_col]).strip(); m_key = m_label.lower()
@@ -364,7 +447,6 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
         else:
             w_eff = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
 
-        # Red Alliance
         for t in [r1, r2]:
             if (m_key, t) in match_dqs:
                 stats[t]["Losses"] += 1
@@ -375,7 +457,6 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
             else:
                 stats[t]["Losses"] += 1; stats[t]["SP"] += losing_sc
 
-        # Blue Alliance
         for t in [b1, b2]:
             if (m_key, t) in match_dqs:
                 stats[t]["Losses"] += 1
@@ -491,6 +572,10 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
     std_comp = comp_z.std()
     df_ranks["Lucky_Factor"] = np.round(50.0 + 50.0 * (comp_z / (3.0 * (std_comp if std_comp and std_comp > 0 else 1.0))), 1)
 
+    # 6. Extract Playoff / Bracket Finish
+    playoff_finishes = extract_playoff_finishes(df_matches, all_teams)
+    df_ranks["Playoff_Finish"] = df_ranks["Team"].map(lambda t: playoff_finishes.get(t, "-"))
+
     if auto_detected_dqs:
         with st.expander("🚨 Auto-Detected Disqualifications (Cross-Reconciled)", expanded=True):
             for alert in auto_detected_dqs:
@@ -501,7 +586,7 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
             for alert in scoring_anomalies:
                 st.write(alert)
 
-    col_order = ["Actual_Rank", "Team"]
+    col_order = ["Actual_Rank", "Team", "Playoff_Finish"]
     for c in ["WP", "AP", "SP", "AWP", "Wins", "Losses", "Ties"]:
         if c in df_ranks.columns: col_order.append(c)
     col_order += ["Avg_Teammate_Rank", "Avg_Opponent_Rank", "Schedule_Advantage", "SOS_Rank", "Carry_Factor", "Lucky_Factor"]
@@ -516,8 +601,8 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
 @st.cache_data(show_spinner=False)
 def load_all_season_event_data():
     """
-    Scans data/tournaments/ for all tournament archives and computes
-    complete analytics metrics across every event.
+    Scans data/tournaments/ and returns only fully analyzed tournament data.
+    Raw component files (*_rankings.csv, *_matches.*) are strictly ignored.
     """
     events = get_available_events()
     all_dfs = []
@@ -533,13 +618,13 @@ def load_all_season_event_data():
                     continue
             except Exception:
                 pass
-        
-        # Fallback to standalone processed CSV
+
+        # Fallback to saved processed CSV (must have Carry_Factor to be valid)
         path = os.path.join(TOURNAMENTS_DIR, f"{ev}.csv")
         if os.path.exists(path):
             try:
                 df_saved = pd.read_csv(path)
-                if "Team" in df_saved.columns:
+                if "Team" in df_saved.columns and "Carry_Factor" in df_saved.columns:
                     df_saved["Tournament"] = ev
                     all_dfs.append(df_saved)
             except Exception:
@@ -593,12 +678,14 @@ if app_mode == "TM Event Analyzer & Archive":
             top_carry = df_results.sort_values("Carry_Factor", ascending=False).iloc[0]
             luckiest = df_results.sort_values("Lucky_Factor", ascending=False).iloc[0]
             hardest_sos = df_results.sort_values("SOS_Rank").iloc[0]
-            unluckiest = df_results.sort_values("Lucky_Factor").iloc[0]
 
-            c1.metric("Highest Carry Factor", f"{top_carry['Team']} ({top_carry['Carry_Factor']})")
-            c2.metric("Hardest Schedule (#1 SOS)", f"{hardest_sos['Team']}")
-            c3.metric("Luckiest Schedule Draw", f"{luckiest['Team']} ({luckiest['Lucky_Factor']})")
-            c4.metric("Most Suppressed / Tough Luck", f"{unluckiest['Team']} ({unluckiest['Lucky_Factor']})")
+            champs = df_results[df_results["Playoff_Finish"] == "Champion"]["Team"].tolist()
+            champ_str = ", ".join(champs) if champs else "N/A (Quals Only)"
+
+            c1.metric("Tournament Champions", champ_str)
+            c2.metric("Highest Carry Factor", f"{top_carry['Team']} ({top_carry['Carry_Factor']})")
+            c3.metric("Hardest Schedule (#1 SOS)", f"{hardest_sos['Team']}")
+            c4.metric("Luckiest Schedule Draw", f"{luckiest['Team']} ({luckiest['Lucky_Factor']})")
 
             st.subheader("Tournament Advanced Metrics Board")
             st.dataframe(df_results, use_container_width=True)
@@ -609,7 +696,7 @@ if app_mode == "TM Event Analyzer & Archive":
                 st.download_button("📥 Export Clean CSV", data=csv_data, file_name="tournament_analytics.csv", mime="text/csv")
             with b_col2:
                 if selected_event == "-- Upload New Event Below --":
-                    event_name = st.text_input("Archive Event Name (e.g., 2026-10-31_Marion_Harding):", value=f"Event_{datetime.now().strftime('%Y%m%d')}")
+                    event_name = st.text_input("Archive Event Name:", value=f"Event_{datetime.now().strftime('%Y%m%d')}")
                     if st.button("💾 Save Event to Tournament Archive"):
                         save_path = os.path.join(TOURNAMENTS_DIR, f"{event_name.strip()}.csv")
                         df_results.to_csv(save_path, index=False)
@@ -631,14 +718,13 @@ if app_mode == "TM Event Analyzer & Archive":
 # ==========================================
 elif app_mode == "Season Historical Stats & Dossiers":
     st.subheader("📊 Overall Season Historical Team Analytics")
-    st.write("Aggregated season-wide performance metrics compiled across all uploaded tournament archives.")
+    st.write("Aggregated season-wide performance metrics compiled across all analyzed tournament archives.")
 
     df_season = load_all_season_event_data()
 
     if df_season.empty:
-        st.info("No tournament archives found in `data/tournaments/`. Upload and archive events in Mode 1 to populate season stats.")
+        st.info("No tournament archives found. Upload and link event files in Mode 1 to build season analytics.")
     else:
-        # Build Season Aggregation Table
         agg_rows = []
         for team, grp in df_season.groupby("Team"):
             events_played = len(grp)
@@ -648,54 +734,58 @@ elif app_mode == "Season Historical Stats & Dossiers":
             tot_matches = tot_wins + tot_losses + tot_ties
             win_pct = round(((tot_wins + 0.5 * tot_ties) / max(1, tot_matches)) * 100, 1)
 
-            avg_rank = round(grp["Actual_Rank"].mean(), 1) if "Actual_Rank" in grp.columns else np.nan
-            best_rank = int(grp["Actual_Rank"].min()) if "Actual_Rank" in grp.columns else np.nan
+            avg_qual_rank = round(grp["Actual_Rank"].mean(), 1) if "Actual_Rank" in grp.columns else np.nan
+            best_qual_rank = int(grp["Actual_Rank"].min()) if "Actual_Rank" in grp.columns else np.nan
+
+            # Playoff Finishes
+            all_finishes = grp["Playoff_Finish"].dropna().tolist() if "Playoff_Finish" in grp.columns else []
+            valid_finishes = [f for f in all_finishes if f in PLAYOFF_ORDER and f != "-"]
+            best_playoff = min(valid_finishes, key=lambda x: PLAYOFF_ORDER[x]) if valid_finishes else "Quals"
+
             mean_carry = round(grp["Carry_Factor"].mean(), 1) if "Carry_Factor" in grp.columns else np.nan
             mean_ap = round(grp["AP"].mean(), 1) if "AP" in grp.columns else np.nan
             mean_sp = round(grp["SP"].mean(), 1) if "SP" in grp.columns else np.nan
             tot_awp = int(grp["AWP"].sum()) if "AWP" in grp.columns else 0
             mean_sos = round(grp["SOS_Rank"].mean(), 1) if "SOS_Rank" in grp.columns else np.nan
-            mean_luck = round(grp["Lucky_Factor"].mean(), 1) if "Lucky_Factor" in grp.columns else np.nan
 
             agg_rows.append({
                 "Team": team,
                 "Events_Played": events_played,
                 "Record": f"{tot_wins}-{tot_losses}-{tot_ties}",
                 "Win_Pct": win_pct,
-                "Best_Finish": f"#{best_rank}" if pd.notna(best_rank) else "N/A",
-                "Avg_Finish": avg_rank,
+                "Best_Qual_Rank": f"#{best_qual_rank}",
+                "Best_Playoff_Finish": best_playoff,
+                "Avg_Qual_Rank": avg_qual_rank,
                 "Mean_Carry_Factor": mean_carry,
                 "Mean_AP": mean_ap,
                 "Total_AWP": tot_awp,
                 "Mean_SP": mean_sp,
                 "Avg_SOS_Rank": mean_sos,
-                "Mean_Lucky_Factor": mean_luck,
-                "_raw_best": best_rank
+                "_sort_playoff": PLAYOFF_ORDER.get(best_playoff, 99)
             })
 
         df_leaderboard = pd.DataFrame(agg_rows)
 
-        # Filters Row
         flt_col1, flt_col2, flt_col3 = st.columns([1, 1, 2])
         with flt_col1:
             min_ev = st.number_input("Minimum Events Attended:", min_value=1, max_value=max(1, int(df_leaderboard["Events_Played"].max())), value=1, step=1)
         with flt_col2:
             sort_by = st.selectbox(
                 "Sort Leaderboard By:",
-                ["Mean_Carry_Factor", "Win_Pct", "Avg_Finish", "Mean_AP", "Events_Played"],
+                ["Mean_Carry_Factor", "Win_Pct", "Best_Playoff_Finish", "Best_Qual_Rank", "Avg_Qual_Rank", "Mean_AP", "Events_Played"],
                 index=0
             )
         with flt_col3:
             search_query = st.text_input("Filter by Team #:", placeholder="e.g. 2011, 6741, 6978").strip().upper()
 
-        # Apply Filters
         filtered_df = df_leaderboard[df_leaderboard["Events_Played"] >= min_ev].copy()
         if search_query:
             filtered_df = filtered_df[filtered_df["Team"].str.contains(search_query, na=False)]
 
-        ascending = True if sort_by in ["Avg_Finish", "_raw_best"] else False
-        filtered_df = filtered_df.sort_values(by=[sort_by], ascending=[ascending]).reset_index(drop=True)
-        display_df = filtered_df.drop(columns=["_raw_best"])
+        sort_col = "_sort_playoff" if sort_by == "Best_Playoff_Finish" else sort_by
+        ascending = True if sort_by in ["Avg_Qual_Rank", "Best_Playoff_Finish", "Best_Qual_Rank"] else False
+        filtered_df = filtered_df.sort_values(by=[sort_col], ascending=[ascending]).reset_index(drop=True)
+        display_df = filtered_df.drop(columns=["_sort_playoff"])
         display_df.index = display_df.index + 1
 
         st.dataframe(display_df, use_container_width=True)
@@ -714,14 +804,14 @@ elif app_mode == "Season Historical Stats & Dossiers":
 
         d_c1, d_c2, d_c3, d_c4, d_c5, d_c6 = st.columns(6)
         d_c1.metric("Events Attended", t_summary["Events_Played"])
-        d_c2.metric("Best Seeding Finish", t_summary["Best_Finish"])
-        d_c3.metric("Avg Seeding Finish", f"#{t_summary['Avg_Finish']}")
+        d_c2.metric("Best Qual Seed", t_summary["Best_Qual_Rank"])
+        d_c3.metric("Best Playoff Finish", t_summary["Best_Playoff_Finish"])
         d_c4.metric("Season Record", t_summary["Record"], f"{t_summary['Win_Pct']}% Win Rate")
         d_c5.metric("Mean Carry Factor", t_summary["Mean_Carry_Factor"])
         d_c6.metric("Mean AP", t_summary["Mean_AP"])
 
         st.markdown(f"#### **{selected_team}** Tournament Log")
-        log_cols = [c for c in ["Tournament", "Actual_Rank", "Record", "WP", "AP", "SP", "AWP", "Carry_Factor", "SOS_Rank", "Lucky_Factor"] if c in t_records.columns]
+        log_cols = [c for c in ["Tournament", "Actual_Rank", "Playoff_Finish", "WP", "AP", "SP", "AWP", "Carry_Factor", "SOS_Rank", "Lucky_Factor"] if c in t_records.columns]
         st.dataframe(t_records[log_cols], use_container_width=True)
 
 # ==========================================
