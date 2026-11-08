@@ -139,22 +139,25 @@ def parse_manual_overrides(text):
     return overrides
 
 def get_available_events():
-    """Returns clean, unique event names without treating component files as distinct events."""
+    """
+    Returns clean, lowercase, deduplicated event identifiers.
+    Prevents duplicate entries from case differences (e.g., Boo_at_Woo vs boo_at_woo).
+    """
     if not os.path.exists(TOURNAMENTS_DIR):
         return []
     files = os.listdir(TOURNAMENTS_DIR)
     events = set()
     for f in files:
         if f.endswith((".csv", ".xlsx", ".xls")):
-            base_name = f.rsplit(".", 1)[0]
+            base_name = f.rsplit(".", 1)[0].strip()
             # Strip component suffixes
             for suffix in ["_matches", "_rankings", "-matches", "-rankings", "_results", "-results"]:
                 if base_name.lower().endswith(suffix):
                     base_name = base_name[:-len(suffix)]
                     break
-            # Ignore naked component files
-            if base_name.lower() not in ["matches", "rankings", "results", ""]:
-                events.add(base_name)
+            cleaned = base_name.strip()
+            if cleaned.lower() not in ["matches", "rankings", "results", ""]:
+                events.add(cleaned.lower())  # Normalize to lowercase
     return sorted(list(events))
 
 def load_preloaded_event_files(event_prefix):
@@ -602,38 +605,51 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
 def load_all_season_event_data():
     """
     Scans data/tournaments/ and returns only fully analyzed tournament data.
-    Raw component files (*_rankings.csv, *_matches.*) are strictly ignored.
+    Automatically prevents double-counting duplicate files and merges casing.
     """
     events = get_available_events()
     all_dfs = []
+    processed_events = set()
 
     for ev in events:
+        ev_key = ev.lower()
+        if ev_key in processed_events:
+            continue
+
         df_m, df_r = load_preloaded_event_files(ev)
+        
+        # 1. Primary: compute from linked match + ranking files
         if df_m is not None:
             try:
                 df_res, _ = analyze_tournament(df_m, df_r)
                 if df_res is not None and not df_res.empty:
-                    df_res["Tournament"] = ev
+                    df_res["Tournament"] = ev.replace("_", " ").title()
                     all_dfs.append(df_res)
+                    processed_events.add(ev_key)
                     continue
             except Exception:
                 pass
 
-        # Fallback to saved processed CSV (must have Carry_Factor to be valid)
-        path = os.path.join(TOURNAMENTS_DIR, f"{ev}.csv")
-        if os.path.exists(path):
-            try:
-                df_saved = pd.read_csv(path)
-                if "Team" in df_saved.columns and "Carry_Factor" in df_saved.columns:
-                    df_saved["Tournament"] = ev
-                    all_dfs.append(df_saved)
-            except Exception:
-                continue
+        # 2. Secondary fallback: check for standalone saved CSV
+        for f in os.listdir(TOURNAMENTS_DIR):
+            base, ext = os.path.splitext(f)
+            if ext.lower() == ".csv" and base.lower() == ev_key:
+                full_path = os.path.join(TOURNAMENTS_DIR, f)
+                try:
+                    df_saved = pd.read_csv(full_path)
+                    if "Team" in df_saved.columns and "Carry_Factor" in df_saved.columns:
+                        df_saved["Tournament"] = ev.replace("_", " ").title()
+                        all_dfs.append(df_saved)
+                        processed_events.add(ev_key)
+                        break
+                except Exception:
+                    continue
 
     if all_dfs:
-        return pd.concat(all_dfs, ignore_index=True)
+        # Final safety net: drop duplicate rows for the same team in the same tournament
+        combined = pd.concat(all_dfs, ignore_index=True)
+        return combined.drop_duplicates(subset=["Tournament", "Team"])
     return pd.DataFrame()
-
 # ==========================================
 # MODE 1: TM EVENT ANALYZER & ARCHIVE
 # ==========================================
