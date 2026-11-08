@@ -319,6 +319,76 @@ def extract_playoff_finishes(df_matches, all_teams):
 
     return finishes
 
+def parse_elimination_bracket(df_matches):
+    """
+    Extracts structured elimination match results (Finals, Semifinals, Quarterfinals, Round of 16).
+    """
+    match_col = next((c for c in df_matches.columns if "match" in c.lower()), None)
+    r1_col = next((c for c in df_matches.columns if "red" in c.lower() and "1" in c.lower()), None)
+    r2_col = next((c for c in df_matches.columns if "red" in c.lower() and "2" in c.lower()), None)
+    b1_col = next((c for c in df_matches.columns if "blue" in c.lower() and "1" in c.lower()), None)
+    b2_col = next((c for c in df_matches.columns if "blue" in c.lower() and "2" in c.lower()), None)
+    r_score_col = next((c for c in df_matches.columns if "red" in c.lower() and "score" in c.lower()), None)
+    b_score_col = next((c for c in df_matches.columns if "blue" in c.lower() and "score" in c.lower()), None)
+    winner_col = next((c for c in df_matches.columns if "winner" in c.lower()), None)
+
+    if not match_col or not all([r1_col, r2_col, b1_col, b2_col, r_score_col, b_score_col]):
+        return None, [], []
+
+    m_series = df_matches[match_col].astype(str).str.lower().str.strip()
+    elim_mask = ~m_series.str.startswith("qual") & ~m_series.str.startswith("prac")
+    elim_df = df_matches[elim_mask].copy()
+
+    if elim_df.empty:
+        return None, [], []
+
+    parsed_elims = []
+    champions = []
+    finalists = []
+
+    for _, row in elim_df.iterrows():
+        m_name = str(row[match_col]).strip()
+        m_lower = m_name.lower()
+        r1, _ = clean_team_token(row[r1_col]); r2, _ = clean_team_token(row[r2_col])
+        b1, _ = clean_team_token(row[b1_col]); b2, _ = clean_team_token(row[b2_col])
+
+        r_sc = int(float(row[r_score_col])) if pd.notna(row[r_score_col]) else 0
+        b_sc = int(float(row[b_score_col])) if pd.notna(row[b_score_col]) else 0
+        
+        w = str(row[winner_col]).strip().capitalize() if winner_col and pd.notna(row[winner_col]) else ""
+        if w not in ["Red", "Blue"]:
+            w = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
+
+        stage = "Other"
+        if any(k in m_lower for k in ["final", "finals"]) and not any(k in m_lower for k in ["semi", "quarter"]):
+            stage = "Finals"
+            if w == "Red":
+                champions = [r1, r2]
+                finalists = [b1, b2]
+            elif w == "Blue":
+                champions = [b1, b2]
+                finalists = [r1, r2]
+        elif any(k in m_lower for k in ["semi", "sf"]):
+            stage = "Semifinals"
+        elif any(k in m_lower for k in ["quarter", "qf"]):
+            stage = "Quarterfinals"
+        elif any(k in m_lower for k in ["round of 16", "r16"]):
+            stage = "Round of 16"
+
+        winner_str = f"Red ({r1} & {r2}) 🏆" if w == "Red" else (f"Blue ({b1} & {b2}) 🏆" if w == "Blue" else "Tie")
+
+        parsed_elims.append({
+            "Stage": stage,
+            "Match": m_name,
+            "Red Alliance": f"{r1} & {r2}",
+            "Score": f"{r_sc} - {b_sc}",
+            "Blue Alliance": f"{b1} & {b2}",
+            "Winner": winner_str,
+            "Margin": abs(r_sc - b_sc)
+        })
+
+    return pd.DataFrame(parsed_elims), champions, finalists
+
 # ==========================================
 # CORE ANALYTICAL ENGINE
 # ==========================================
@@ -811,29 +881,83 @@ if app_mode == "TM Event Analyzer & Archive":
             c3.metric("Hardest Quality SOS", f"{hardest_qsos['Team']} (+{hardest_qsos['Quality_SOS']})")
             c4.metric("Highest Win Luck Delta", f"{most_luck['Team']} (+{most_luck['Win_Luck']} xW)")
 
-            st.subheader("Tournament Advanced Metrics Board")
-            st.dataframe(df_results, use_container_width=True)
+            # Mode 1 Tabs Navigation
+            tab_standings, tab_bracket, tab_audit = st.tabs([
+                "📊 Standings & Advanced Metrics",
+                "🏆 Elimination Bracket & Results",
+                "🔍 Single-Team Match Audit"
+            ])
 
-            b_col1, b_col2 = st.columns([1, 1])
-            with b_col1:
-                csv_data = df_results.to_csv(index=False).encode("utf-8")
-                st.download_button("📥 Export Clean CSV", data=csv_data, file_name="tournament_analytics.csv", mime="text/csv")
-            with b_col2:
-                if selected_event == "-- Upload New Event Below --":
-                    event_name = st.text_input("Archive Event Name:", value=f"Event_{datetime.now().strftime('%Y%m%d')}")
-                    if st.button("💾 Save Event to Tournament Archive"):
-                        save_path = os.path.join(TOURNAMENTS_DIR, f"{event_name.strip()}.csv")
-                        df_results.to_csv(save_path, index=False)
-                        st.success(f"Saved event to archive as {event_name.strip()}.csv!")
-                        st.rerun()
+            # TAB 1: STANDINGS & METRICS BOARD
+            with tab_standings:
+                st.subheader("Tournament Advanced Metrics Board")
+                st.dataframe(df_results, use_container_width=True)
 
-            if df_audit is not None and not df_audit.empty:
-                st.markdown("---")
-                st.subheader("🔍 Single-Team Match Audit")
-                team_list = df_results["Team"].tolist()
-                sel_team = st.selectbox("Inspect Match Log for Team:", team_list)
-                team_matches = df_audit[df_audit["Team"] == sel_team].reset_index(drop=True)
-                st.dataframe(team_matches[["Match", "Alliance", "Partner", "Opponents", "Score", "Result", "Match_Leverage"]], use_container_width=True)
+                b_col1, b_col2 = st.columns([1, 1])
+                with b_col1:
+                    csv_data = df_results.to_csv(index=False).encode("utf-8")
+                    st.download_button("📥 Export Clean CSV", data=csv_data, file_name="tournament_analytics.csv", mime="text/csv")
+                with b_col2:
+                    if selected_event == "-- Upload New Event Below --":
+                        event_name = st.text_input("Archive Event Name:", value=f"Event_{datetime.now().strftime('%Y%m%d')}")
+                        if st.button("💾 Save Event to Tournament Archive"):
+                            save_path = os.path.join(TOURNAMENTS_DIR, f"{event_name.strip()}.csv")
+                            df_results.to_csv(save_path, index=False)
+                            st.success(f"Saved event to archive as {event_name.strip()}.csv!")
+                            st.rerun()
+
+            # TAB 2: ELIMINATION BRACKET & MATCH RESULTS
+            with tab_bracket:
+                df_elims, champs_list, finalists_list = parse_elimination_bracket(df_m)
+
+                if df_elims is None or df_elims.empty:
+                    st.info("ℹ️ No elimination matches found in this match export (this file contains qualification matches only).")
+                else:
+                    # Elimination podium banner
+                    p_c1, p_c2 = st.columns(2)
+                    with p_c1:
+                        if champs_list:
+                            st.success(f"🏆 **Tournament Champions:** Alliance **{' & '.join(champs_list)}**")
+                        else:
+                            st.info("🏆 **Tournament Champions:** Finals In Progress / Undetermined")
+                    with p_c2:
+                        if finalists_list:
+                            st.warning(f"🥈 **Tournament Finalists:** Alliance **{' & '.join(finalists_list)}**")
+                        else:
+                            st.info("🥈 **Tournament Finalists:** Undetermined")
+
+                    # Stage-by-stage display
+                    st.markdown("### ⚔️ Elimination Playoff Rounds")
+                    stages = ["Finals", "Semifinals", "Quarterfinals", "Round of 16"]
+                    found_any_stage = False
+
+                    for stage_name in stages:
+                        stage_matches = df_elims[df_elims["Stage"] == stage_name]
+                        if not stage_matches.empty:
+                            found_any_stage = True
+                            with st.expander(f"📌 {stage_name} ({len(stage_matches)} Match{'es' if len(stage_matches) > 1 else ''})", expanded=(stage_name in ["Finals", "Semifinals"])):
+                                st.dataframe(stage_matches[["Match", "Red Alliance", "Score", "Blue Alliance", "Winner", "Margin"]], use_container_width=True)
+
+                    if not found_any_stage:
+                        st.dataframe(df_elims[["Match", "Red Alliance", "Score", "Blue Alliance", "Winner", "Margin"]], use_container_width=True)
+
+                    st.markdown("---")
+                    st.markdown("### 📋 All Elimination Match Results")
+                    st.dataframe(df_elims, use_container_width=True)
+
+                    csv_elims = df_elims.to_csv(index=False).encode("utf-8")
+                    st.download_button("📥 Export Elimination Results CSV", data=csv_elims, file_name="elimination_bracket_results.csv", mime="text/csv")
+
+            # TAB 3: SINGLE-TEAM MATCH AUDIT
+            with tab_audit:
+                if df_audit is not None and not df_audit.empty:
+                    st.subheader("🔍 Single-Team Match Audit")
+                    team_list = df_results["Team"].tolist()
+                    sel_team = st.selectbox("Inspect Match Log for Team:", team_list)
+                    team_matches = df_audit[df_audit["Team"] == sel_team].reset_index(drop=True)
+                    st.dataframe(team_matches[["Match", "Alliance", "Partner", "Opponents", "Score", "Result", "Match_Leverage"]], use_container_width=True)
+                else:
+                    st.info("No audit rows generated for this tournament.")
     else:
         st.info("👈 Upload your Tournament Manager files or choose a preloaded tournament from the sidebar.")
 
