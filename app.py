@@ -45,7 +45,6 @@ def get_current_poll_cycle():
         tz = ZoneInfo("America/New_York")
         now = datetime.now(tz)
     except Exception:
-        # Fallback to UTC-5 (EST)
         tz = timezone(timedelta(hours=-5))
         now = datetime.now(tz)
 
@@ -287,7 +286,7 @@ def extract_playoff_finishes(df_matches, all_teams):
 # ==========================================
 # CORE ANALYTICAL ENGINE
 # ==========================================
-def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
+def analyze_tournament(df_matches, df_rankings_file=None, overrides_text="", silent=False):
     df_matches.columns = [str(c).strip() for c in df_matches.columns]
     match_col = next((c for c in df_matches.columns if "match" in c.lower()), None)
     r1_col = next((c for c in df_matches.columns if "red" in c.lower() and "1" in c.lower()), None)
@@ -592,15 +591,17 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
     playoff_finishes = extract_playoff_finishes(df_matches, all_teams)
     df_ranks["Playoff_Finish"] = df_ranks["Team"].map(lambda t: playoff_finishes.get(t, "-"))
 
-    if auto_detected_dqs:
-        with st.expander("🚨 Auto-Detected Disqualifications (Cross-Reconciled)", expanded=True):
-            for alert in auto_detected_dqs:
-                st.write(alert)
+    # Render Alerts (Only rendered when viewing Mode 1 directly)
+    if not silent:
+        if auto_detected_dqs:
+            with st.expander("🚨 Auto-Detected Disqualifications (Cross-Reconciled)", expanded=True):
+                for alert in auto_detected_dqs:
+                    st.write(alert)
 
-    if scoring_anomalies:
-        with st.expander("⚖️ Score vs. Winner Overrides (Ref Decisions)", expanded=False):
-            for alert in scoring_anomalies:
-                st.write(alert)
+        if scoring_anomalies:
+            with st.expander("⚖️ Score vs. Winner Overrides (Ref Decisions)", expanded=False):
+                for alert in scoring_anomalies:
+                    st.write(alert)
 
     col_order = ["Actual_Rank", "Team", "Playoff_Finish"]
     for c in ["WP", "AP", "SP", "AWP", "Wins", "Losses", "Ties"]:
@@ -618,7 +619,7 @@ def load_all_season_event_data():
     """
     Scans data/tournaments/ and returns clean analyzed tournament data.
     Automatically prevents case duplication (Boo_at_Woo vs boo_at_woo)
-    and strictly ignores raw component files (*_rankings.csv, *_matches.*).
+    and runs silently so alert boxes do not spill onto other pages.
     """
     events = get_available_events()
     all_dfs = []
@@ -632,7 +633,7 @@ def load_all_season_event_data():
         df_m, df_r = load_preloaded_event_files(ev)
         if df_m is not None:
             try:
-                df_res, _ = analyze_tournament(df_m, df_r)
+                df_res, _ = analyze_tournament(df_m, df_r, silent=True)
                 if df_res is not None and not df_res.empty:
                     df_res["Tournament"] = ev.replace("_", " ").title()
                     all_dfs.append(df_res)
@@ -698,7 +699,7 @@ if app_mode == "TM Event Analyzer & Archive":
         df_r = parse_file(uploaded_rankings) if uploaded_rankings is not None else None
 
     if df_m is not None:
-        df_results, df_audit = analyze_tournament(df_m, df_r, manual_overrides)
+        df_results, df_audit = analyze_tournament(df_m, df_r, manual_overrides, silent=False)
 
         if df_results is not None:
             c1, c2, c3, c4 = st.columns(4)
@@ -847,8 +848,7 @@ elif app_mode == "Top 25 Poll & Community Rankings":
     cycle_id, cycle_label, next_reset_str = get_current_poll_cycle()
 
     st.subheader("🏆 V5RC Community Top 25 Power Rankings Portal")
-    
-    # Active Poll Status Box
+
     s_col1, s_col2 = st.columns([2, 1])
     with s_col1:
         st.markdown(f"**Current Poll Cycle:** `{cycle_label}` *(Resets weekly on Sunday @ 12:01 AM EST)*")
@@ -858,7 +858,6 @@ elif app_mode == "Top 25 Poll & Community Rankings":
     tab_ballot, tab_consensus = st.tabs(["🗳️ Submit Top 25 Ballot", "📊 Consensus Power Rankings"])
     df_season = load_all_season_event_data()
 
-    # Pre-compute team quick stats for the interactive voting UI
     team_stat_map = {}
     known_teams = []
     if not df_season.empty:
@@ -887,7 +886,6 @@ elif app_mode == "Top 25 Poll & Community Rankings":
             }
         known_teams = sorted(list(team_stat_map.keys()))
 
-    # TAB 1: SUBMIT BALLOT (Side-by-Side Scout Layout)
     with tab_ballot:
         st.markdown(f"### Cast Your Top 25 Ballot — {cycle_label}")
         st.caption("Use the Live Scouting Cheatsheet on the right to evaluate team records and Carry Factors while voting.")
@@ -908,7 +906,6 @@ elif app_mode == "Top 25 Poll & Community Rankings":
                     return "-- Select Team --"
                 return team_stat_map.get(t, {}).get("display", t)
 
-            # Two-column layout for ballot entries
             b_left, b_right = st.columns(2)
             for r in range(1, 26):
                 target_col = b_left if r <= 13 else b_right
@@ -927,7 +924,6 @@ elif app_mode == "Top 25 Poll & Community Rankings":
                         if val.strip():
                             ballot_choices[r] = val.strip().upper()
 
-            # Duplicate and completeness validation
             picked_teams = list(ballot_choices.values())
             duplicates = {}
             for rank_num, t_val in ballot_choices.items():
@@ -965,7 +961,6 @@ elif app_mode == "Top 25 Poll & Community Rankings":
                 st.success(f"🎉 Ballot submitted successfully for **{cycle_label}**!")
                 st.rerun()
 
-        # Side-by-Side Live Scouting Reference Panel
         with col_scout:
             st.markdown("#### 📋 Live Scouting Reference Cheatsheet")
             st.caption("Inspect team performance across past competitions to evaluate rankings.")
@@ -1015,7 +1010,6 @@ elif app_mode == "Top 25 Poll & Community Rankings":
             else:
                 st.info("No tournament data loaded yet. Upload and link event files in Mode 1 to populate this cheatsheet.")
 
-    # TAB 2: CONSENSUS POWER RANKINGS
     with tab_consensus:
         st.markdown("### Community Consensus Top 25 Leaderboard")
         st.caption("Scoring (Borda Count): #1 = 25 pts, #2 = 24 pts, down to #25 = 1 pt.")
@@ -1023,7 +1017,6 @@ elif app_mode == "Top 25 Poll & Community Rankings":
         if os.path.exists(BALLOTS_FILE) and os.path.getsize(BALLOTS_FILE) > 0:
             df_all_ballots = pd.read_csv(BALLOTS_FILE)
 
-            # Assign fallback cycle to legacy ballots if column missing
             if "Cycle_ID" not in df_all_ballots.columns:
                 df_all_ballots["Cycle_ID"] = cycle_id
                 df_all_ballots["Cycle_Label"] = cycle_label
