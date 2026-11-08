@@ -30,12 +30,41 @@ app_mode = st.sidebar.radio(
 PLAYOFF_ORDER = {"Champion": 1, "Finalist": 2, "SF": 3, "QF": 4, "R16": 5, "Quals": 6, "-": 7}
 
 # ==========================================
+# METRIC GLOSSARY DIALOG
+# ==========================================
+@st.dialog("📖 V5RC Analytics Metric Definitions & Glossary", width="large")
+def show_metric_glossary():
+    st.markdown("""
+    ### 🏆 Official Tournament Manager Metrics
+    * **Actual Rank:** Official qualification seeding rank awarded by Tournament Manager.
+    * **WP (Win Points):** Official tournament points ($2$ for a win, $1$ for a tie, $+1$ for Autonomous Win Point).
+    * **AP (Autonomous Points):** Autonomous period point total accumulated across matches.
+    * **SP (Strength of Schedule Points):** Cumulative score of the losing alliance in each completed match.
+    * **AWP (Autonomous Win Point):** Total autonomous win points awarded for rule completion ($0$ to $6$).
+    * **Playoff Finish:** Deepest elimination bracket stage achieved (`Champion`, `Finalist`, `SF`, `QF`, `R16`, or `Quals`).
+
+    ---
+
+    ### 🧠 Advanced Capability & Gauntlet Metrics
+    * **Carry Factor (RCI):** Normalized rating ($50.0\text{ mean}$) measuring individual robot match leverage. Heavy underdog wins yield massive positive leverage, while blowouts against weak seeds receive steep penalties.
+    * **Quality SOS ($\text{SOS}_{\text{Quality}}$):** $\text{Mean Opponent Carry Factor} - \text{Mean Partner Carry Factor}$. Replaces circular rank-based SOS with true robot quality. Positive numbers indicate a brutal draw; negative indicates an advantageous schedule.
+    * **Quality SOS Rank:** Tournament ranking from #1 (toughest opponent gauntlet) to #N (easiest matchups).
+    * **Expected Wins ($xW$):** The statistical expected win count calculated using logistic probability from relative alliance strength.
+    * **Win Luck ($\Delta W$):** $\text{Actual Wins} - xW$. Positive values mean the team won more games than expected; negative values indicate matches lost strictly due to alliance pairings.
+    * **Lucky Factor:** Normalized rating ($50.0\text{ neutral}$) reflecting seeding surplus adjusted for schedule advantage.
+
+    ---
+
+    ### 🎯 Scoring Floor, Ceiling & Consistency
+    * **Score Floor:** 10th-percentile match score (guaranteed minimum scoring output in high-pressure matches).
+    * **Score Ceiling:** 90th-percentile match score (peak ceiling capability under optimal match conditions).
+    * **Consistency Rating:** Score stability percentage derived from the coefficient of variation ($1 - \frac{\sigma}{\mu}$). Separates consistent playoff locks ($>90\%$) from volatile glass cannons.
+    """)
+
+# ==========================================
 # TIMEZONE & POLL CYCLE LOGIC
 # ==========================================
 def get_current_poll_cycle():
-    """
-    Computes weekly poll cycles resetting every Sunday at 12:01 AM EST.
-    """
     try:
         from zoneinfo import ZoneInfo
         tz = ZoneInfo("America/New_York")
@@ -193,7 +222,6 @@ def get_available_events():
             if ev_key not in event_mtimes or mtime > event_mtimes[ev_key]:
                 event_mtimes[ev_key] = mtime
 
-    # Sort descending: newest files first
     sorted_events = sorted(event_mtimes.keys(), key=lambda ev: event_mtimes[ev], reverse=True)
     return sorted_events
 
@@ -611,26 +639,22 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text="", sil
         r_all_cf = carry_dict.get(r1, 50.0) + carry_dict.get(r2, 50.0)
         b_all_cf = carry_dict.get(b1, 50.0) + carry_dict.get(b2, 50.0)
 
-        # Logistic Expected Win Probabilities
         delta_r_cf = r_all_cf - b_all_cf
         p_red_win = 1.0 / (1.0 + 10.0 ** (-delta_r_cf / 40.0))
         p_blue_win = 1.0 - p_red_win
 
-        # Red Alliance
         for t, p in [(r1, r2), (r2, r1)]:
             partner_cf_list[t].append(carry_dict.get(p, 50.0))
             opp_cf_list[t].extend([carry_dict.get(b1, 50.0), carry_dict.get(b2, 50.0)])
             scores_put_up[t].append(r_sc)
             xw_accum[t] += p_red_win
 
-        # Blue Alliance
         for t, p in [(b1, b2), (b2, b1)]:
             partner_cf_list[t].append(carry_dict.get(p, 50.0))
             opp_cf_list[t].extend([carry_dict.get(r1, 50.0), carry_dict.get(r2, 50.0)])
             scores_put_up[t].append(b_sc)
             xw_accum[t] += p_blue_win
 
-    # Map Quality SOS & Expected Wins
     df_ranks["Quality_SOS"] = df_ranks["Team"].map(
         lambda t: round(np.mean(opp_cf_list[t]) - np.mean(partner_cf_list[t]), 2)
         if opp_cf_list[t] and partner_cf_list[t] else 0.0
@@ -658,7 +682,6 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text="", sil
     playoff_finishes = extract_playoff_finishes(df_matches, all_teams)
     df_ranks["Playoff_Finish"] = df_ranks["Team"].map(lambda t: playoff_finishes.get(t, "-"))
 
-    # Render Alerts (Only rendered when viewing Mode 1 directly)
     if not silent:
         if auto_detected_dqs:
             with st.expander("🚨 Auto-Detected Disqualifications (Cross-Reconciled)", expanded=True):
@@ -689,10 +712,6 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text="", sil
 # MULTI-EVENT SEASON DATA LOADER
 # ==========================================
 def load_all_season_event_data():
-    """
-    Scans data/tournaments/ and returns clean analyzed tournament data
-    ordered from most recent event to least recent event.
-    """
     events = get_available_events()
     all_dfs = []
     processed_events = set()
@@ -738,6 +757,12 @@ def load_all_season_event_data():
 # ==========================================
 if app_mode == "TM Event Analyzer & Archive":
     st.subheader("Tournament Manager Results, Analytics & Archival")
+
+    # Glossary button row
+    col_hdr, col_btn = st.columns([3, 1])
+    with col_btn:
+        if st.button("📖 Metric Definitions & Glossary", key="m1_glossary_btn", use_container_width=True):
+            show_metric_glossary()
 
     st.sidebar.header("📁 Load Saved Tournament")
     available_events = get_available_events()
@@ -818,6 +843,12 @@ if app_mode == "TM Event Analyzer & Archive":
 elif app_mode == "Season Historical Stats & Dossiers":
     st.subheader("📊 Overall Season Historical Team Analytics")
     st.write("Aggregated season-wide performance metrics compiled across all analyzed tournament archives (ordered from newest to oldest).")
+
+    # Glossary button row
+    col_hdr, col_btn = st.columns([3, 1])
+    with col_btn:
+        if st.button("📖 Metric Definitions & Glossary", key="m2_glossary_btn", use_container_width=True):
+            show_metric_glossary()
 
     df_season = load_all_season_event_data()
 
