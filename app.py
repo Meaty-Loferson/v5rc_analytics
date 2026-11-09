@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import os
+import re
 import requests
 from datetime import datetime
 
@@ -21,7 +22,7 @@ os.makedirs(BALLOTS_DIR, exist_ok=True)
 # ==========================================
 class VexApiClient:
     def __init__(self):
-        # Background configuration; not exposed to end-users
+        # Locked in background; never exposed to user UI
         self.base_url = st.secrets.get("VEX_API_BASE_URL", "https://api.3145h.org/v1").rstrip("/")
         self.api_key = st.secrets.get("VEX_API_KEY", "")
         self.session = requests.Session()
@@ -509,6 +510,8 @@ if app_mode == "📊 TM Event Analyzer & Archive":
         st.session_state["df_audit"] = None
     if "loaded_source_label" not in st.session_state:
         st.session_state["loaded_source_label"] = ""
+    if "archive_name_input" not in st.session_state:
+        st.session_state["archive_name_input"] = ""
 
     st.sidebar.header("📥 Ingestion Method")
     ingest_source = st.sidebar.radio(
@@ -532,11 +535,9 @@ if app_mode == "📊 TM Event Analyzer & Archive":
                         
                         if df_m.empty:
                             st.sidebar.warning(f"⚠️ **{event_title}** has no qualification matches published in the API yet.")
-                            
                             df_t = api_client.get_event_teams(target_id)
                             if not df_t.empty:
                                 st.sidebar.info(f"💡 Found **{len(df_t)} registered teams** for this event. You can load this roster into the Sandbox.")
-                                
                             with st.sidebar.expander("🔍 Diagnostics (API Probe Details)"):
                                 st.json(debug_info)
                         else:
@@ -549,6 +550,10 @@ if app_mode == "📊 TM Event Analyzer & Archive":
                             st.session_state["df_results"] = res
                             st.session_state["df_audit"] = audit
                             st.session_state["loaded_source_label"] = f"{event_title} ({target_id})"
+                            
+                            # Cleanly preset the archive name box to the tournament title
+                            clean_preset = re.sub(r'[\\/*?:"<>|]', "", f"{event_title}_{target_id}").strip().replace(" ", "_")
+                            st.session_state["archive_name_input"] = clean_preset
                             st.rerun()
                     except Exception as e:
                         st.sidebar.error(f"Sync Failed: {str(e)}")
@@ -567,6 +572,7 @@ if app_mode == "📊 TM Event Analyzer & Archive":
                         st.session_state["df_results"] = load_tournament_file(archive_path)
                         st.session_state["loaded_source_label"] = selected_archive
                         st.session_state["df_audit"] = None
+                        st.session_state["archive_name_input"] = os.path.splitext(selected_archive)[0]
                         st.rerun()
         else:
             st.sidebar.info("No archives found in `data/tournaments/`.")
@@ -586,6 +592,7 @@ if app_mode == "📊 TM Event Analyzer & Archive":
                     st.session_state["df_results"] = res
                     st.session_state["df_audit"] = audit
                     st.session_state["loaded_source_label"] = uploaded_matches.name
+                    st.session_state["archive_name_input"] = os.path.splitext(uploaded_matches.name)[0].replace(" ", "_")
                     st.rerun()
 
     # Main Dashboard Display
@@ -611,11 +618,21 @@ if app_mode == "📊 TM Event Analyzer & Archive":
             csv_data = df_results.to_csv(index=False).encode("utf-8")
             st.download_button("📥 Export Clean CSV", data=csv_data, file_name="tournament_analytics.csv", mime="text/csv")
         with b_col2:
-            event_name = st.text_input("Save As Archive Name:", value=f"Event_{datetime.now().strftime('%Y%m%d_%H%M')}")
+            if not st.session_state.get("archive_name_input"):
+                raw_title = st.session_state.get("loaded_source_label", "Event")
+                st.session_state["archive_name_input"] = re.sub(r'[\\/*?:"<>|]', "", raw_title).strip().replace(" ", "_")
+
+            st.text_input("Save As Archive Name:", key="archive_name_input")
+            
             if st.button("💾 Save Event to Tournament Archive"):
-                save_path = os.path.join(TOURNAMENTS_DIR, f"{event_name.strip()}.csv")
+                entered_name = st.session_state.get("archive_name_input", "").strip()
+                cleaned_name = re.sub(r'[\\/*?:"<>|]', "", entered_name).strip().replace(" ", "_")
+                if not cleaned_name:
+                    cleaned_name = f"Event_{datetime.now().strftime('%Y%m%d_%H%M')}"
+                
+                save_path = os.path.join(TOURNAMENTS_DIR, f"{cleaned_name}.csv")
                 df_results.to_csv(save_path, index=False)
-                st.success(f"Saved event to archive as `{event_name.strip()}.csv`!")
+                st.success(f"Saved event to archive as `{cleaned_name}.csv`!")
                 st.rerun()
     else:
         st.markdown("---")
@@ -755,7 +772,7 @@ elif app_mode == "🗳️ Top 25 Poll & Community Rankings":
             display_cols = [c for c in ["Tournament", "Actual_Rank", "WP", "AP", "SP", "Carry_Factor", "SOS_Rank", "Lucky_Factor"] if c in team_records.columns]
             st.dataframe(team_records[display_cols].reset_index(drop=True), use_container_width=True)
         else:
-            st.info("No tournament archives found. Add `.xls`, `.xlsx`, or `.csv` files to `data/tournaments/` or save an event in Mode 1.")
+            st.info("No tournament archives found. Save an event to archive in Mode 1 or pull a completed event via API.")
 
 # ==============================================================================
 # MODE 3: FUTURE TOURNAMENT SANDBOX (API TEAM ROSTER LOAD)
