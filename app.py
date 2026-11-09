@@ -2,12 +2,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import os
-import re
-from datetime import datetime, timedelta, timezone
+import requests
+from datetime import datetime
 
 st.set_page_config(page_title="V5RC Tournament Intelligence & Community Hub", layout="wide")
 
-# Directory Configuration
+# Directory paths for persistent storage
 DATA_DIR = "data"
 TOURNAMENTS_DIR = os.path.join(DATA_DIR, "tournaments")
 BALLOTS_DIR = os.path.join(DATA_DIR, "ballots")
@@ -16,383 +16,150 @@ BALLOTS_FILE = os.path.join(BALLOTS_DIR, "ballots.csv")
 os.makedirs(TOURNAMENTS_DIR, exist_ok=True)
 os.makedirs(BALLOTS_DIR, exist_ok=True)
 
-# Navigation
+# ==========================================
+# REST API CLIENT (AXUM / ROBOTEVENTS SPEC)
+# ==========================================
+class VexApiClient:
+    def __init__(self, base_url: str = None, api_key: str = None):
+        self.base_url = (base_url or st.secrets.get("VEX_API_BASE_URL", "http://localhost:3000/v1")).rstrip("/")
+        self.api_key = api_key or st.secrets.get("VEX_API_KEY", "")
+        self.session = requests.Session()
+        if self.api_key:
+            self.session.headers.update({"Authorization": f"Bearer {self.api_key}"})
+
+    def _get(self, endpoint: str, params: dict = None) -> dict:
+        url = f"{self.base_url}/{endpoint.lstrip('/')}"
+        res = self.session.get(url, params=params or {}, timeout=12)
+        res.raise_for_status()
+        return res.json()
+
+    def get_event_teams(self, event_id: str | int) -> pd.DataFrame:
+        all_teams = []
+        page = 1
+        while True:
+            payload = self._get(f"/events/{event_id}/teams", params={"page": page, "per_page": 50})
+            data = payload.get("data", [])
+            for t in data:
+                all_teams.append({
+                    "Team": t.get("number", ""),
+                    "Name": t.get("team_name", ""),
+                    "Organization": t.get("organization", ""),
+                    "City": t.get("location", {}).get("city", "")
+                })
+            pagination = payload.get("pagination", {})
+            if page >= pagination.get("total_pages", 1):
+                break
+            page += 1
+        return pd.DataFrame(all_teams)
+
+    def get_event_matches(self, event_id: str | int) -> pd.DataFrame:
+        all_matches = []
+        page = 1
+        while True:
+            payload = self._get(f"/events/{event_id}/matches", params={"page": page, "per_page": 50})
+            data = payload.get("data", [])
+            for m in data:
+                alliances = m.get("alliances", [])
+                red = next((a for a in alliances if a.get("color", "").lower() == "red"), {})
+                blue = next((a for a in alliances if a.get("color", "").lower() == "blue"), {})
+                
+                red_teams = [t.get("team", {}).get("name", t.get("number", "")) for t in red.get("teams", [])]
+                blue_teams = [t.get("team", {}).get("name", t.get("number", "")) for t in blue.get("teams", [])]
+                
+                if len(red_teams) >= 2 and len(blue_teams) >= 2:
+                    r_sc = float(red.get("score", 0.0))
+                    b_sc = float(blue.get("score", 0.0))
+                    winner = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
+                    all_matches.append({
+                        "Match": m.get("name", f"Qualifier #{m.get('matchnum', '')}"),
+                        "Red Team 1": red_teams[0],
+                        "Red Team 2": red_teams[1],
+                        "Blue Team 1": blue_teams[0],
+                        "Blue Team 2": blue_teams[1],
+                        "Red Score": r_sc,
+                        "Blue Score": b_sc,
+                        "Winner": winner
+                    })
+
+            pagination = payload.get("pagination", {})
+            if page >= pagination.get("total_pages", 1):
+                break
+            page += 1
+        return pd.DataFrame(all_matches)
+
+    def get_event_rankings(self, event_id: str | int) -> pd.DataFrame:
+        payload = self._get(f"/events/{event_id}/rankings")
+        rows = []
+        for r in payload.get("data", []):
+            rows.append({
+                "Actual_Rank": r.get("rank"),
+                "Team": r.get("team", {}).get("name", r.get("team_number", "")),
+                "WP": r.get("wp", 0),
+                "AP": r.get("ap", 0),
+                "SP": r.get("sp", 0),
+                "Wins": r.get("wins", 0),
+                "Losses": r.get("losses", 0),
+                "Ties": r.get("ties", 0)
+            })
+        return pd.DataFrame(rows)
+
+api_client = VexApiClient()
+
+# ==========================================
+# SIDEBAR: NAVIGATION
+# ==========================================
 app_mode = st.sidebar.radio(
     "Navigation:",
     [
-        "TM Event Analyzer & Archive",
-        "Season Historical Stats & Dossiers",
-        "Top 25 Poll & Community Rankings",
-        "Future Tournament Sandbox"
+        "📊 TM Event Analyzer & Archive", 
+        "🗳️ Top 25 Poll & Community Rankings", 
+        "🔮 Future Tournament Sandbox"
     ]
 )
 
-PLAYOFF_ORDER = {"Champion": 1, "Finalist": 2, "SF": 3, "QF": 4, "R16": 5, "Quals": 6, "-": 7}
-
 # ==========================================
-# METRIC GLOSSARY DIALOG
-# ==========================================
-@st.dialog("📖 V5RC Analytics Metric Definitions & Glossary", width="large")
-def show_metric_glossary():
-    st.markdown("""
-    ### 🏆 Official Tournament Manager Metrics
-    * **Actual Rank:** Official qualification seeding rank awarded by Tournament Manager.
-    * **WP (Win Points):** Official tournament points ($2$ for a win, $1$ for a tie, $+1$ for Autonomous Win Point).
-    * **AP (Autonomous Points):** Autonomous period point total accumulated across matches.
-    * **SP (Strength of Schedule Points):** Cumulative score of the losing alliance in each completed match.
-    * **AWP (Autonomous Win Point):** Total autonomous win points awarded for rule completion ($0$ to $6$).
-    * **Playoff Finish:** Deepest elimination bracket stage achieved (`Champion`, `Finalist`, `SF`, `QF`, `R16`, or `Quals`).
-
-    ---
-
-    ### 🧠 Advanced Capability & Gauntlet Metrics
-    * **Carry Factor (RCI):** Normalized rating ($50.0\text{ mean}$) measuring individual robot match leverage. Heavy underdog wins yield massive positive leverage, while blowouts against weak seeds receive steep penalties.
-    * **Quality SOS ($\text{SOS}_{\text{Quality}}$):** $\text{Mean Opponent Carry Factor} - \text{Mean Partner Carry Factor}$. Replaces circular rank-based SOS with true robot quality. Positive numbers indicate a brutal draw; negative indicates an advantageous schedule.
-    * **Quality SOS Rank:** Tournament ranking from #1 (toughest opponent gauntlet) to #N (easiest matchups).
-    * **Expected Wins ($xW$):** The statistical expected win count calculated using logistic probability from relative alliance strength.
-    * **Win Luck ($\Delta W$):** $\text{Actual Wins} - xW$. Positive values mean the team won more games than expected; negative values indicate matches lost strictly due to alliance pairings.
-    * **Lucky Factor:** Normalized rating ($50.0\text{ neutral}$) reflecting seeding surplus adjusted for schedule advantage.
-
-    ---
-
-    ### 🎯 Scoring Floor, Ceiling & Consistency
-    * **Score Floor:** 10th-percentile match score (guaranteed minimum scoring output in high-pressure matches).
-    * **Score Ceiling:** 90th-percentile match score (peak ceiling capability under optimal match conditions).
-    * **Consistency Rating:** Score stability percentage derived from the coefficient of variation ($1 - \frac{\sigma}{\mu}$). Separates consistent playoff locks ($>90\%$) from volatile glass cannons.
-    """)
-
-# ==========================================
-# TIMEZONE & POLL CYCLE LOGIC
-# ==========================================
-def get_current_poll_cycle():
-    try:
-        from zoneinfo import ZoneInfo
-        tz = ZoneInfo("America/New_York")
-        now = datetime.now(tz)
-    except Exception:
-        tz = timezone(timedelta(hours=-5))
-        now = datetime.now(tz)
-
-    days_since_sunday = (now.weekday() + 1) % 7
-    sunday_cutoff = (now - timedelta(days=days_since_sunday)).replace(hour=0, minute=1, second=0, microsecond=0)
-
-    if now < sunday_cutoff:
-        sunday_cutoff -= timedelta(days=7)
-
-    cycle_id = sunday_cutoff.strftime("%Y-%m-%d")
-    cycle_label = f"Week of {sunday_cutoff.strftime('%b %d, %Y')}"
-    next_reset = sunday_cutoff + timedelta(days=7)
-    next_reset_str = next_reset.strftime("%A, %b %d @ 12:01 AM EST")
-
-    return cycle_id, cycle_label, next_reset_str
-
-# ==========================================
-# FILE INGESTION & DATA PARSING
+# FILE PARSER & ANALYTICAL ENGINE
 # ==========================================
 def parse_file(file):
-    if file is None:
-        return None
+    if hasattr(file, "name"):
+        fname = file.name.lower()
+    else:
+        fname = str(file).lower()
 
-    if isinstance(file, str) and os.path.exists(file):
-        if os.path.getsize(file) == 0:
-            st.warning(f"File '{os.path.basename(file)}' is empty (0 bytes).")
-            return None
-
-    header_bytes = b""
+    if fname.endswith(".csv"):
+        return pd.read_csv(file)
+    if fname.endswith(".xlsx"):
+        return pd.read_excel(file, engine="openpyxl")
     try:
-        if isinstance(file, str):
-            with open(file, "rb") as f:
-                header_bytes = f.read(8)
-        elif hasattr(file, "read"):
-            header_bytes = file.read(8)
-            file.seek(0)
+        return pd.read_excel(file, engine="calamine")
     except Exception:
-        pass
-
-    # 1. Zip-compressed Office Open XML (.xlsx)
-    if header_bytes.startswith(b"PK\x03\x04"):
         try:
-            if hasattr(file, "seek"):
-                file.seek(0)
-            return pd.read_excel(file, engine="openpyxl")
+            return pd.read_excel(file, engine="xlrd")
         except Exception:
             return pd.read_excel(file)
 
-    # 2. Legacy OLE Compound Document (.xls)
-    if header_bytes.startswith(b"\xd0\xcf\x11\xe0"):
-        for eng in ["calamine", "xlrd"]:
-            try:
-                if hasattr(file, "seek"):
-                    file.seek(0)
-                return pd.read_excel(file, engine=eng)
-            except Exception:
-                continue
-        return pd.read_excel(file)
-
-    # 3. Plain text / CSV with encoding fallbacks
-    for enc in ["utf-8", "utf-8-sig", "cp1252", "latin1", "utf-16"]:
-        try:
-            if hasattr(file, "seek"):
-                file.seek(0)
-            return pd.read_csv(file, encoding=enc)
-        except (UnicodeDecodeError, UnicodeError):
-            continue
-        except pd.errors.EmptyDataError:
-            return None
-        except Exception:
-            break
-
-    try:
-        if hasattr(file, "seek"):
-            file.seek(0)
-        return pd.read_excel(file)
-    except Exception as e:
-        filename = file if isinstance(file, str) else getattr(file, "name", "unknown")
-        st.error(f"Could not parse '{filename}': {str(e)}")
-        return None
-
-def clean_team_token(token):
-    raw = str(token).strip()
-    is_dq = bool(re.search(r'\bDQ\b|\(DQ\)', raw, re.IGNORECASE))
-    clean_team = re.sub(r'[\(\[\{]?\bDQ\b[\)\]\}]?|\*', '', raw, flags=re.IGNORECASE).strip()
-    return clean_team, is_dq
-
 def parse_manual_overrides(text):
-    overrides = {"match_winner": {}, "team_dq": set(), "alliance_dq": {}}
+    overrides = {}
     if not text.strip():
         return overrides
-
     for line in text.strip().split("\n"):
         parts = line.split(":")
         if len(parts) >= 2:
             action = parts[0].strip().lower()
             details = parts[1].strip()
-
             if action == "tie":
-                overrides["match_winner"][details.lower()] = "Tie"
-            elif action == "winner":
-                sub = details.split(",")
-                if len(sub) == 2:
-                    overrides["match_winner"][sub[0].strip().lower()] = sub[1].strip().capitalize()
-            elif action == "dq":
+                overrides[details.lower()] = {"winner": "Tie"}
+            elif action in ["winner", "dq"]:
                 sub = details.split(",")
                 if len(sub) == 2:
                     m_key = sub[0].strip().lower()
-                    target = sub[1].strip()
-                    target_lower = target.lower()
-
-                    if target_lower in ["red", "blue"]:
-                        overrides["alliance_dq"].setdefault(m_key, set()).add(target.capitalize())
-                    elif target_lower in ["red 1", "red1"]:
-                        overrides["team_dq"].add((m_key, "red1"))
-                    elif target_lower in ["red 2", "red2"]:
-                        overrides["team_dq"].add((m_key, "red2"))
-                    elif target_lower in ["blue 1", "blue1"]:
-                        overrides["team_dq"].add((m_key, "blue1"))
-                    elif target_lower in ["blue 2", "blue2"]:
-                        overrides["team_dq"].add((m_key, "blue2"))
-                    else:
-                        overrides["team_dq"].add((m_key, target.upper()))
+                    win_val = sub[1].strip().capitalize()
+                    if action == "dq":
+                        win_val = "Blue" if "red" in win_val.lower() else "Red"
+                    overrides[m_key] = {"winner": win_val}
     return overrides
 
-def get_available_events():
-    """
-    Returns clean, lowercase event names sorted from MOST RECENT to LEAST RECENT
-    based on disk modification timestamps.
-    """
-    if not os.path.exists(TOURNAMENTS_DIR):
-        return []
-    files = os.listdir(TOURNAMENTS_DIR)
-    event_mtimes = {}
-
-    for f in files:
-        full_path = os.path.join(TOURNAMENTS_DIR, f)
-        base_name = f.rsplit(".", 1)[0].strip()
-        for suffix in ["_matches", "_rankings", "-matches", "-rankings", "_results", "-results"]:
-            if base_name.lower().endswith(suffix):
-                base_name = base_name[:-len(suffix)]
-                break
-        cleaned = base_name.strip()
-        if cleaned.lower() not in ["matches", "rankings", "results", ""]:
-            try:
-                mtime = os.path.getmtime(full_path)
-            except Exception:
-                mtime = 0
-            ev_key = cleaned.lower()
-            if ev_key not in event_mtimes or mtime > event_mtimes[ev_key]:
-                event_mtimes[ev_key] = mtime
-
-    sorted_events = sorted(event_mtimes.keys(), key=lambda ev: event_mtimes[ev], reverse=True)
-    return sorted_events
-
-def load_preloaded_event_files(event_prefix):
-    matches_file = None
-    rankings_file = None
-
-    if not os.path.exists(TOURNAMENTS_DIR):
-        return None, None
-
-    all_files = os.listdir(TOURNAMENTS_DIR)
-    matching_files = [f for f in all_files if f.lower().startswith(event_prefix.lower())]
-
-    for f in matching_files:
-        full_path = os.path.join(TOURNAMENTS_DIR, f)
-        lower_name = f.lower()
-
-        if any(k in lower_name for k in ["rank", "standing"]):
-            rankings_file = full_path
-        elif any(k in lower_name for k in ["match", "qual", "result", "schedule"]):
-            matches_file = full_path
-        elif not matches_file:
-            matches_file = full_path
-
-    df_m = parse_file(matches_file) if matches_file else None
-    df_r = parse_file(rankings_file) if rankings_file else None
-    return df_m, df_r
-
-def extract_playoff_finishes(df_matches, all_teams):
-    match_col = next((c for c in df_matches.columns if "match" in c.lower()), None)
-    r1_col = next((c for c in df_matches.columns if "red" in c.lower() and "1" in c.lower()), None)
-    r2_col = next((c for c in df_matches.columns if "red" in c.lower() and "2" in c.lower()), None)
-    b1_col = next((c for c in df_matches.columns if "blue" in c.lower() and "1" in c.lower()), None)
-    b2_col = next((c for c in df_matches.columns if "blue" in c.lower() and "2" in c.lower()), None)
-    r_score_col = next((c for c in df_matches.columns if "red" in c.lower() and "score" in c.lower()), None)
-    b_score_col = next((c for c in df_matches.columns if "blue" in c.lower() and "score" in c.lower()), None)
-    winner_col = next((c for c in df_matches.columns if "winner" in c.lower()), None)
-
-    finishes = {t: "Quals" for t in all_teams}
-    if not match_col or not all([r1_col, r2_col, b1_col, b2_col]):
-        return finishes
-
-    m_series = df_matches[match_col].astype(str).str.lower().str.strip()
-    elim_mask = ~m_series.str.startswith("qual") & ~m_series.str.startswith("prac")
-    elim_df = df_matches[elim_mask].copy()
-
-    if elim_df.empty:
-        return {t: "-" for t in all_teams}
-
-    finals_winners = set()
-    finals_losers = set()
-    sf_teams = set()
-    qf_teams = set()
-    r16_teams = set()
-
-    for _, row in elim_df.iterrows():
-        m_name = str(row[match_col]).lower().strip()
-        r1, _ = clean_team_token(row[r1_col]); r2, _ = clean_team_token(row[r2_col])
-        b1, _ = clean_team_token(row[b1_col]); b2, _ = clean_team_token(row[b2_col])
-        r_teams = [r1, r2]; b_teams = [b1, b2]
-
-        r_sc = float(row[r_score_col]) if r_score_col and pd.notna(row[r_score_col]) else 0.0
-        b_sc = float(row[b_score_col]) if b_score_col and pd.notna(row[b_score_col]) else 0.0
-        w = str(row[winner_col]).strip().capitalize() if winner_col else ""
-        if w not in ["Red", "Blue"]:
-            w = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
-
-        if any(k in m_name for k in ["final", "finals"]) and not any(k in m_name for k in ["semi", "quarter"]):
-            if w == "Red":
-                finals_winners.update(r_teams)
-                finals_losers.update(b_teams)
-            elif w == "Blue":
-                finals_winners.update(b_teams)
-                finals_losers.update(r_teams)
-            else:
-                finals_losers.update(r_teams + b_teams)
-        elif any(k in m_name for k in ["semi", "sf"]):
-            sf_teams.update(r_teams + b_teams)
-        elif any(k in m_name for k in ["quarter", "qf"]):
-            qf_teams.update(r_teams + b_teams)
-        elif any(k in m_name for k in ["round of 16", "r16"]):
-            r16_teams.update(r_teams + b_teams)
-
-    for t in all_teams:
-        if t in finals_winners:
-            finishes[t] = "Champion"
-        elif t in finals_losers:
-            finishes[t] = "Finalist"
-        elif t in sf_teams:
-            finishes[t] = "SF"
-        elif t in qf_teams:
-            finishes[t] = "QF"
-        elif t in r16_teams:
-            finishes[t] = "R16"
-
-    return finishes
-
-def parse_elimination_bracket(df_matches):
-    """
-    Extracts structured elimination match results (Finals, Semifinals, Quarterfinals, Round of 16).
-    """
-    match_col = next((c for c in df_matches.columns if "match" in c.lower()), None)
-    r1_col = next((c for c in df_matches.columns if "red" in c.lower() and "1" in c.lower()), None)
-    r2_col = next((c for c in df_matches.columns if "red" in c.lower() and "2" in c.lower()), None)
-    b1_col = next((c for c in df_matches.columns if "blue" in c.lower() and "1" in c.lower()), None)
-    b2_col = next((c for c in df_matches.columns if "blue" in c.lower() and "2" in c.lower()), None)
-    r_score_col = next((c for c in df_matches.columns if "red" in c.lower() and "score" in c.lower()), None)
-    b_score_col = next((c for c in df_matches.columns if "blue" in c.lower() and "score" in c.lower()), None)
-    winner_col = next((c for c in df_matches.columns if "winner" in c.lower()), None)
-
-    if not match_col or not all([r1_col, r2_col, b1_col, b2_col, r_score_col, b_score_col]):
-        return None, [], []
-
-    m_series = df_matches[match_col].astype(str).str.lower().str.strip()
-    elim_mask = ~m_series.str.startswith("qual") & ~m_series.str.startswith("prac")
-    elim_df = df_matches[elim_mask].copy()
-
-    if elim_df.empty:
-        return None, [], []
-
-    parsed_elims = []
-    champions = []
-    finalists = []
-
-    for _, row in elim_df.iterrows():
-        m_name = str(row[match_col]).strip()
-        m_lower = m_name.lower()
-        r1, _ = clean_team_token(row[r1_col]); r2, _ = clean_team_token(row[r2_col])
-        b1, _ = clean_team_token(row[b1_col]); b2, _ = clean_team_token(row[b2_col])
-
-        r_sc = int(float(row[r_score_col])) if pd.notna(row[r_score_col]) else 0
-        b_sc = int(float(row[b_score_col])) if pd.notna(row[b_score_col]) else 0
-        
-        w = str(row[winner_col]).strip().capitalize() if winner_col and pd.notna(row[winner_col]) else ""
-        if w not in ["Red", "Blue"]:
-            w = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
-
-        stage = "Other"
-        if any(k in m_lower for k in ["final", "finals"]) and not any(k in m_lower for k in ["semi", "quarter"]):
-            stage = "Finals"
-            if w == "Red":
-                champions = [r1, r2]
-                finalists = [b1, b2]
-            elif w == "Blue":
-                champions = [b1, b2]
-                finalists = [r1, r2]
-        elif any(k in m_lower for k in ["semi", "sf"]):
-            stage = "Semifinals"
-        elif any(k in m_lower for k in ["quarter", "qf"]):
-            stage = "Quarterfinals"
-        elif any(k in m_lower for k in ["round of 16", "r16"]):
-            stage = "Round of 16"
-
-        winner_str = f"Red ({r1} & {r2}) 🏆" if w == "Red" else (f"Blue ({b1} & {b2}) 🏆" if w == "Blue" else "Tie")
-
-        parsed_elims.append({
-            "Stage": stage,
-            "Match": m_name,
-            "Red Alliance": f"{r1} & {r2}",
-            "Score": f"{r_sc} - {b_sc}",
-            "Blue Alliance": f"{b1} & {b2}",
-            "Winner": winner_str,
-            "Margin": abs(r_sc - b_sc)
-        })
-
-    return pd.DataFrame(parsed_elims), champions, finalists
-
-# ==========================================
-# CORE ANALYTICAL ENGINE
-# ==========================================
-def analyze_tournament(df_matches, df_rankings_file=None, overrides_text="", silent=False):
+def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
     df_matches.columns = [str(c).strip() for c in df_matches.columns]
     match_col = next((c for c in df_matches.columns if "match" in c.lower()), None)
     r1_col = next((c for c in df_matches.columns if "red" in c.lower() and "1" in c.lower()), None)
@@ -404,270 +171,119 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text="", sil
     winner_col = next((c for c in df_matches.columns if "winner" in c.lower()), None)
 
     if not all([match_col, r1_col, r2_col, b1_col, b2_col, r_score_col, b_score_col]):
-        st.error(f"Could not map required columns: {list(df_matches.columns)}")
+        st.error(f"Could not map match columns. Detected headers: {list(df_matches.columns)}")
         return None, None
 
     qual_df = df_matches[df_matches[match_col].astype(str).str.startswith("Qualifier")].copy()
     qual_df[r_score_col] = pd.to_numeric(qual_df[r_score_col], errors="coerce").fillna(0.0)
     qual_df[b_score_col] = pd.to_numeric(qual_df[b_score_col], errors="coerce").fillna(0.0)
+    overrides = parse_manual_overrides(overrides_text)
 
     raw_teams = set()
     for col in [r1_col, r2_col, b1_col, b2_col]:
-        for val in qual_df[col].dropna():
-            team_clean, _ = clean_team_token(val)
-            if team_clean and team_clean.lower() != "nan" and not team_clean.isdigit():
-                raw_teams.add(team_clean)
+        raw_teams.update(qual_df[col].dropna().astype(str).str.strip().unique())
+    all_teams = sorted([t for t in raw_teams if t and t.lower() != "nan" and not t.isdigit()])
 
-    all_teams = sorted(list(raw_teams))
-    overrides = parse_manual_overrides(overrides_text)
-    match_dqs = set()
-    auto_detected_dqs = []
-    scoring_anomalies = []
-
-    # 1. Ingest Official TM Rankings
     df_ranks = None
-    official_data = {}
     if df_rankings_file is not None:
         df_rankings_file.columns = [str(c).strip() for c in df_rankings_file.columns]
         team_rk_col = next((c for c in df_rankings_file.columns if "team" in c.lower()), None)
         rk_col = next((c for c in df_rankings_file.columns if "rank" in c.lower()), None)
         wp_col = next((c for c in df_rankings_file.columns if "wp" in c.lower()), None)
-        ap_col = next((c for c in df_rankings_file.columns if "ap" in c.lower()), None)
         sp_col = next((c for c in df_rankings_file.columns if "sp" in c.lower()), None)
-        wins_col = next((c for c in df_rankings_file.columns if "win" in c.lower() and "point" not in c.lower()), None)
-        loss_col = next((c for c in df_rankings_file.columns if "loss" in c.lower()), None)
-        ties_col = next((c for c in df_rankings_file.columns if "tie" in c.lower()), None)
-
         if team_rk_col and rk_col:
             df_ranks = df_rankings_file.copy()
-            df_ranks["Team"] = df_ranks[team_rk_col].astype(str).map(lambda x: clean_team_token(x)[0])
+            df_ranks["Team"] = df_ranks[team_rk_col].astype(str).str.strip()
             df_ranks["Actual_Rank"] = pd.to_numeric(df_ranks[rk_col], errors="coerce").fillna(99).astype(int)
             if wp_col: df_ranks["WP"] = pd.to_numeric(df_ranks[wp_col], errors="coerce").fillna(0).astype(int)
-            if ap_col: df_ranks["AP"] = pd.to_numeric(df_ranks[ap_col], errors="coerce").fillna(0).astype(int)
             if sp_col: df_ranks["SP"] = pd.to_numeric(df_ranks[sp_col], errors="coerce").fillna(0).astype(int)
-            if wins_col: df_ranks["Wins"] = pd.to_numeric(df_ranks[wins_col], errors="coerce").fillna(0).astype(int)
-            if loss_col: df_ranks["Losses"] = pd.to_numeric(df_ranks[loss_col], errors="coerce").fillna(0).astype(int)
-            if ties_col: df_ranks["Ties"] = pd.to_numeric(df_ranks[ties_col], errors="coerce").fillna(0).astype(int)
-
-            if all(k in df_ranks.columns for k in ["WP", "Wins", "Ties"]):
-                df_ranks["AWP"] = (df_ranks["WP"] - (2 * df_ranks["Wins"] + df_ranks["Ties"])).clip(lower=0)
-
-            for _, r in df_ranks.iterrows():
-                official_data[r["Team"]] = r.to_dict()
-
-    # 2. Pre-scan matches
-    team_match_history = {t: [] for t in all_teams}
-    for _, row in qual_df.iterrows():
-        m_label = str(row[match_col]).strip(); m_key = m_label.lower()
-        r1, r1_dq = clean_team_token(row[r1_col]); r2, r2_dq = clean_team_token(row[r2_col])
-        b1, b1_dq = clean_team_token(row[b1_col]); b2, b2_dq = clean_team_token(row[b2_col])
-        r_sc = float(row[r_score_col]); b_sc = float(row[b_score_col])
-        w = str(row[winner_col]).strip() if winner_col else ""
-
-        for t, is_dq in [(r1, r1_dq), (r2, r2_dq), (b1, b1_dq), (b2, b2_dq)]:
-            if is_dq:
-                match_dqs.add((m_key, t))
-                auto_detected_dqs.append(f"{m_label}: Team **{t}** marked as DQ in match export.")
-
-        if w == "Red" and b_sc > r_sc:
-            scoring_anomalies.append(f"{m_label}: Winner is Red despite score being Blue {int(b_sc)} - Red {int(r_sc)}.")
-        elif w == "Blue" and r_sc > b_sc:
-            scoring_anomalies.append(f"{m_label}: Winner is Blue despite score being Red {int(r_sc)} - Blue {int(b_sc)}.")
-
-        if m_key in overrides["match_winner"]:
-            w_eff = overrides["match_winner"][m_key]
-        elif w in ["Red", "Blue", "Tie"]:
-            w_eff = w
-        else:
-            w_eff = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
-
-        losing_sc = int(min(r_sc, b_sc))
-        for t, alliance, partner in [(r1, "Red", r2), (r2, "Red", r1), (b1, "Blue", b2), (b2, "Blue", b1)]:
-            res = "Win" if w_eff == alliance else ("Tie" if w_eff == "Tie" else "Loss")
-            team_match_history[t].append({
-                "match": m_label, "match_key": m_key, "partner": partner,
-                "alliance": alliance, "result": res, "losing_score": losing_sc
-            })
-
-    # 3. Precision Mold-Matching DQ Engine
-    if official_data:
-        import itertools
-        for t in all_teams:
-            if t not in official_data:
-                continue
-
-            off_wins = official_data[t].get("Wins")
-            off_ties = official_data[t].get("Ties")
-            off_sp = official_data[t].get("SP")
-
-            calc_wins = sum(1 for m in team_match_history[t] if m["result"] == "Win")
-            calc_ties = sum(1 for m in team_match_history[t] if m["result"] == "Tie")
-            calc_sp = sum(m["losing_score"] for m in team_match_history[t])
-
-            win_deficit = (calc_wins - off_wins) if off_wins is not None else 0
-            tie_deficit = (calc_ties - off_ties) if off_ties is not None else 0
-            sp_deficit = (calc_sp - off_sp) if off_sp is not None else 0
-
-            if win_deficit > 0:
-                win_matches = [m for m in team_match_history[t] if m["result"] == "Win"]
-                matched = False
-                for combo in itertools.combinations(win_matches, win_deficit):
-                    if sum(m["losing_score"] for m in combo) == sp_deficit:
-                        for m in combo:
-                            match_dqs.add((m["match_key"], t))
-                            auto_detected_dqs.append(
-                                f"Mold Match: Team **{t}** DQ isolated to **{m['match']}** "
-                                f"(Win revoked, {m['losing_score']} SP forfeited; Partner {m['partner']} kept win)."
-                            )
-                        matched = True
-                        break
-
-                if not matched:
-                    for m in win_matches:
-                        p = m["partner"]
-                        p_off_wins = official_data.get(p, {}).get("Wins")
-                        p_calc_wins = sum(1 for pm in team_match_history.get(p, []) if pm["result"] == "Win")
-                        if p_off_wins == p_calc_wins:
-                            match_dqs.add((m["match_key"], t))
-                            auto_detected_dqs.append(f"Auto-Reconciled: Team **{t}** DQ detected in **{m['match']}** (Partner {p} kept win).")
-                            break
-
-            elif tie_deficit > 0:
-                tie_matches = [m for m in team_match_history[t] if m["result"] == "Tie"]
-                for m in tie_matches:
-                    if m["losing_score"] == sp_deficit or sp_deficit == 0:
-                        match_dqs.add((m["match_key"], t))
-                        auto_detected_dqs.append(f"Mold Match: Team **{t}** DQ detected on Tie in **{m['match']}**.")
-                        break
-
-            elif sp_deficit > 0:
-                loss_matches = [m for m in team_match_history[t] if m["result"] == "Loss"]
-                for m in loss_matches:
-                    if m["losing_score"] == sp_deficit:
-                        match_dqs.add((m["match_key"], t))
-                        auto_detected_dqs.append(
-                            f"Mold Match: Team **{t}** DQ detected on loss in **{m['match']}** "
-                            f"({sp_deficit} SP zeroed out per Rule GG6)."
-                        )
-                        break
-
-    # 4. Build official matrix honoring Rule GG6
-    stats = {t: {"Wins": 0, "Losses": 0, "Ties": 0, "WP": 0, "SP": 0} for t in all_teams}
-    for _, row in qual_df.iterrows():
-        m_label = str(row[match_col]).strip(); m_key = m_label.lower()
-        r1, _ = clean_team_token(row[r1_col]); r2, _ = clean_team_token(row[r2_col])
-        b1, _ = clean_team_token(row[b1_col]); b2, _ = clean_team_token(row[b2_col])
-        r_sc = float(row[r_score_col]); b_sc = float(row[b_score_col])
-        losing_sc = int(min(r_sc, b_sc))
-
-        w = str(row[winner_col]).strip() if winner_col else ""
-        if m_key in overrides["match_winner"]:
-            w_eff = overrides["match_winner"][m_key]
-        elif w in ["Red", "Blue", "Tie"]:
-            w_eff = w
-        else:
-            w_eff = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
-
-        for t in [r1, r2]:
-            if (m_key, t) in match_dqs:
-                stats[t]["Losses"] += 1
-            elif w_eff == "Red":
-                stats[t]["Wins"] += 1; stats[t]["WP"] += 2; stats[t]["SP"] += losing_sc
-            elif w_eff == "Tie":
-                stats[t]["Ties"] += 1; stats[t]["WP"] += 1; stats[t]["SP"] += losing_sc
-            else:
-                stats[t]["Losses"] += 1; stats[t]["SP"] += losing_sc
-
-        for t in [b1, b2]:
-            if (m_key, t) in match_dqs:
-                stats[t]["Losses"] += 1
-            elif w_eff == "Blue":
-                stats[t]["Wins"] += 1; stats[t]["WP"] += 2; stats[t]["SP"] += losing_sc
-            elif w_eff == "Tie":
-                stats[t]["Ties"] += 1; stats[t]["WP"] += 1; stats[t]["SP"] += losing_sc
-            else:
-                stats[t]["Losses"] += 1; stats[t]["SP"] += losing_sc
 
     if df_ranks is None:
+        stats = {t: {"Wins": 0, "Losses": 0, "Ties": 0, "WP": 0, "SP": 0} for t in all_teams}
+        for _, row in qual_df.iterrows():
+            m_label = str(row[match_col]).strip().lower()
+            r_teams = [str(row[r1_col]).strip(), str(row[r2_col]).strip()]
+            b_teams = [str(row[b1_col]).strip(), str(row[b2_col]).strip()]
+            r_sc = float(row[r_score_col])
+            b_sc = float(row[b_score_col])
+            w = str(row[winner_col]).strip() if winner_col else ""
+
+            if m_label in overrides:
+                w = overrides[m_label]["winner"]
+            elif w not in ["Red", "Blue", "Tie"]:
+                w = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
+
+            losing_score = int(min(r_sc, b_sc))
+            if w == "Red":
+                for t in r_teams:
+                    if t in stats: stats[t]["Wins"] += 1; stats[t]["WP"] += 2; stats[t]["SP"] += losing_score
+                for t in b_teams:
+                    if t in stats: stats[t]["Losses"] += 1; stats[t]["SP"] += losing_score
+            elif w == "Blue":
+                for t in b_teams:
+                    if t in stats: stats[t]["Wins"] += 1; stats[t]["WP"] += 2; stats[t]["SP"] += losing_score
+                for t in r_teams:
+                    if t in stats: stats[t]["Losses"] += 1; stats[t]["SP"] += losing_score
+            else:
+                for t in r_teams + b_teams:
+                    if t in stats: stats[t]["Ties"] += 1; stats[t]["WP"] += 1; stats[t]["SP"] += losing_score
+
         df_ranks = pd.DataFrame([{"Team": t, **s} for t, s in stats.items()])
         df_ranks = df_ranks.sort_values(by=["WP", "SP"], ascending=[False, False]).reset_index(drop=True)
         df_ranks["Actual_Rank"] = df_ranks.index + 1
 
     rank_map = {row["Team"]: row["Actual_Rank"] for _, row in df_ranks.iterrows()}
-
-    # 5. Schedule Gauntlet, Individual Leverage & Baseline Carry Factor
     carry_sums = {t: 0.0 for t in all_teams}
     teammates = {t: [] for t in all_teams}
     opponents = {t: [] for t in all_teams}
     audit_rows = []
 
     for _, row in qual_df.iterrows():
-        m_label = str(row[match_col]).strip(); m_key = m_label.lower()
-        r1, _ = clean_team_token(row[r1_col]); r2, _ = clean_team_token(row[r2_col])
-        b1, _ = clean_team_token(row[b1_col]); b2, _ = clean_team_token(row[b2_col])
-        r_sc = float(row[r_score_col]); b_sc = float(row[b_score_col])
-
+        m_label = str(row[match_col]).strip()
+        r1, r2 = str(row[r1_col]).strip(), str(row[r2_col]).strip()
+        b1, b2 = str(row[b1_col]).strip(), str(row[b2_col]).strip()
+        r_sc = float(row[r_score_col])
+        b_sc = float(row[b_score_col])
         w = str(row[winner_col]).strip() if winner_col else ""
-        if m_key in overrides["match_winner"]:
-            w_eff = overrides["match_winner"][m_key]
-        elif w in ["Red", "Blue", "Tie"]:
-            w_eff = w
-        else:
-            w_eff = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
 
-        # Red Alliance Leverage
-        if all(t in rank_map for t in [r1, r2, b1, b2]):
+        if m_label.lower() in overrides:
+            w = overrides[m_label.lower()]["winner"]
+        elif w not in ["Red", "Blue", "Tie"]:
+            w = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
+
+        # Red Alliance
+        if r1 in rank_map and r2 in rank_map and b1 in rank_map and b2 in rank_map:
             for t, p in [(r1, r2), (r2, r1)]:
                 teammates[t].append(rank_map[p])
                 opponents[t].extend([rank_map[b1], rank_map[b2]])
                 delta_r = ((rank_map[t] + rank_map[p]) / 2.0) - ((rank_map[b1] + rank_map[b2]) / 2.0)
                 base = (rank_map[p] - rank_map[t]) + 2.0 * max(0.0, delta_r)
-
-                if (m_key, t) in match_dqs:
-                    carry = -abs(base) if base > 0 else base
-                    res_str = "DQ"
-                elif w_eff == "Red":
-                    carry = base * 1.0; res_str = "Win"
-                elif w_eff == "Tie":
-                    carry = base * 0.5; res_str = "Tie"
+                if w == "Red":
+                    carry = base * 1.0
+                elif w == "Tie":
+                    carry = base * 0.5
                 else:
                     w_m = -0.25 * max(0.0, 1.0 - (r_sc / max(b_sc, 1.0)))
                     carry = -abs(base) * abs(w_m) if base > 0 else base * (1.0 - abs(w_m))
-                    res_str = "Loss"
-
                 carry_sums[t] += carry
-                audit_rows.append({
-                    "Match": m_label, "Team": t, "Alliance": "Red", "Partner": p,
-                    "Opponents": f"{b1}, {b2}", "Score": f"{int(r_sc)}-{int(b_sc)}",
-                    "Result": res_str, "Match_Leverage": round(carry, 2)
-                })
+                audit_rows.append({"Match": m_label, "Team": t, "Alliance": "Red", "Partner": p, "Opponents": f"{b1}, {b2}", "Score": f"{int(r_sc)}-{int(b_sc)}", "Result": "Win" if w=="Red" else ("Tie" if w=="Tie" else "Loss"), "Leverage": round(carry, 2)})
 
-        # Blue Alliance Leverage
-        if all(t in rank_map for t in [r1, r2, b1, b2]):
+        # Blue Alliance
+        if b1 in rank_map and b2 in rank_map and r1 in rank_map and r2 in rank_map:
             for t, p in [(b1, b2), (b2, b1)]:
                 teammates[t].append(rank_map[p])
                 opponents[t].extend([rank_map[r1], rank_map[r2]])
                 delta_r = ((rank_map[t] + rank_map[p]) / 2.0) - ((rank_map[r1] + rank_map[r2]) / 2.0)
                 base = (rank_map[p] - rank_map[t]) + 2.0 * max(0.0, delta_r)
-
-                if (m_key, t) in match_dqs:
-                    carry = -abs(base) if base > 0 else base
-                    res_str = "DQ"
-                elif w_eff == "Blue":
-                    carry = base * 1.0; res_str = "Win"
-                elif w_eff == "Tie":
-                    carry = base * 0.5; res_str = "Tie"
+                if w == "Blue":
+                    carry = base * 1.0
+                elif w == "Tie":
+                    carry = base * 0.5
                 else:
                     w_m = -0.25 * max(0.0, 1.0 - (b_sc / max(r_sc, 1.0)))
                     carry = -abs(base) * abs(w_m) if base > 0 else base * (1.0 - abs(w_m))
-                    res_str = "Loss"
-
                 carry_sums[t] += carry
-                audit_rows.append({
-                    "Match": m_label, "Team": t, "Alliance": "Blue", "Partner": p,
-                    "Opponents": f"{r1}, {r2}", "Score": f"{int(b_sc)}-{int(r_sc)}",
-                    "Result": res_str, "Match_Leverage": round(carry, 2)
-                })
+                audit_rows.append({"Match": m_label, "Team": t, "Alliance": "Blue", "Partner": p, "Opponents": f"{r1}, {r2}", "Score": f"{int(b_sc)}-{int(r_sc)}", "Result": "Win" if w=="Blue" else ("Tie" if w=="Tie" else "Loss"), "Leverage": round(carry, 2)})
 
     num_teams = len(all_teams)
     median_rank = (num_teams + 1) / 2.0
@@ -681,7 +297,6 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text="", sil
     df_ranks["SOS_Rank"] = df_ranks["Schedule_Advantage"].rank(ascending=True, method="min").astype(int)
     df_ranks["Carry_Factor"] = df_ranks["Team"].map(lambda t: round(50.0 + 50.0 * ((carry_sums.get(t, 0.0) - mu) / (3.0 * sigma)), 1))
 
-    # Dynamic Expected Rank and Lucky Factor
     intercept = median_rank + (0.6282 * 50.0)
     std_adv = df_ranks["Schedule_Advantage"].std()
     z_sched = (df_ranks["Schedule_Advantage"] - df_ranks["Schedule_Advantage"].mean()) / (std_adv if std_adv and std_adv > 0 else 1.0)
@@ -693,679 +308,273 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text="", sil
     std_comp = comp_z.std()
     df_ranks["Lucky_Factor"] = np.round(50.0 + 50.0 * (comp_z / (3.0 * (std_comp if std_comp and std_comp > 0 else 1.0))), 1)
 
-    # 6. Advanced Stat Engines: Quality SOS, Expected Wins (xW), Floor/Ceiling Index
-    carry_dict = dict(zip(df_ranks["Team"], df_ranks["Carry_Factor"]))
-
-    partner_cf_list = {t: [] for t in all_teams}
-    opp_cf_list = {t: [] for t in all_teams}
-    scores_put_up = {t: [] for t in all_teams}
-    xw_accum = {t: 0.0 for t in all_teams}
-
-    for _, row in qual_df.iterrows():
-        r1, _ = clean_team_token(row[r1_col]); r2, _ = clean_team_token(row[r2_col])
-        b1, _ = clean_team_token(row[b1_col]); b2, _ = clean_team_token(row[b2_col])
-        r_sc = float(row[r_score_col]); b_sc = float(row[b_score_col])
-
-        r_all_cf = carry_dict.get(r1, 50.0) + carry_dict.get(r2, 50.0)
-        b_all_cf = carry_dict.get(b1, 50.0) + carry_dict.get(b2, 50.0)
-
-        delta_r_cf = r_all_cf - b_all_cf
-        p_red_win = 1.0 / (1.0 + 10.0 ** (-delta_r_cf / 40.0))
-        p_blue_win = 1.0 - p_red_win
-
-        for t, p in [(r1, r2), (r2, r1)]:
-            partner_cf_list[t].append(carry_dict.get(p, 50.0))
-            opp_cf_list[t].extend([carry_dict.get(b1, 50.0), carry_dict.get(b2, 50.0)])
-            scores_put_up[t].append(r_sc)
-            xw_accum[t] += p_red_win
-
-        for t, p in [(b1, b2), (b2, b1)]:
-            partner_cf_list[t].append(carry_dict.get(p, 50.0))
-            opp_cf_list[t].extend([carry_dict.get(r1, 50.0), carry_dict.get(r2, 50.0)])
-            scores_put_up[t].append(b_sc)
-            xw_accum[t] += p_blue_win
-
-    df_ranks["Quality_SOS"] = df_ranks["Team"].map(
-        lambda t: round(np.mean(opp_cf_list[t]) - np.mean(partner_cf_list[t]), 2)
-        if opp_cf_list[t] and partner_cf_list[t] else 0.0
-    )
-    df_ranks["Quality_SOS_Rank"] = df_ranks["Quality_SOS"].rank(ascending=False, method="min").astype(int)
-
-    df_ranks["xW"] = df_ranks["Team"].map(lambda t: round(xw_accum.get(t, 0.0), 2))
-    df_ranks["Win_Luck"] = np.round(df_ranks["Wins"] - df_ranks["xW"], 2)
-
-    df_ranks["Score_Floor"] = df_ranks["Team"].map(
-        lambda t: int(np.percentile(scores_put_up[t], 10)) if scores_put_up[t] else 0
-    )
-    df_ranks["Score_Ceiling"] = df_ranks["Team"].map(
-        lambda t: int(np.percentile(scores_put_up[t], 90)) if scores_put_up[t] else 0
-    )
-    def calc_consistency(t):
-        scs = scores_put_up.get(t, [])
-        if not scs or np.mean(scs) == 0:
-            return 50
-        cv = np.std(scs) / np.mean(scs)
-        return max(0, min(100, int(round((1.0 - cv) * 100))))
-    df_ranks["Consistency"] = df_ranks["Team"].map(calc_consistency)
-
-    # 7. Extract Playoff Finish
-    playoff_finishes = extract_playoff_finishes(df_matches, all_teams)
-    df_ranks["Playoff_Finish"] = df_ranks["Team"].map(lambda t: playoff_finishes.get(t, "-"))
-
-    if not silent:
-        if auto_detected_dqs:
-            with st.expander("🚨 Auto-Detected Disqualifications (Cross-Reconciled)", expanded=True):
-                for alert in auto_detected_dqs:
-                    st.write(alert)
-
-        if scoring_anomalies:
-            with st.expander("⚖️ Score vs. Winner Overrides (Ref Decisions)", expanded=False):
-                for alert in scoring_anomalies:
-                    st.write(alert)
-
-    col_order = ["Actual_Rank", "Team", "Playoff_Finish"]
-    for c in ["WP", "AP", "SP", "AWP", "Wins", "Losses", "Ties"]:
+    col_order = ["Actual_Rank", "Team"]
+    for c in ["WP", "AP", "SP", "Wins", "Losses", "Ties"]:
         if c in df_ranks.columns: col_order.append(c)
+    col_order += ["Avg_Teammate_Rank", "Avg_Opponent_Rank", "Schedule_Advantage", "SOS_Rank", "Carry_Factor", "Lucky_Factor"]
+    
+    return df_ranks[[c for c in col_order if c in df_ranks.columns]].sort_values("Actual_Rank").reset_index(drop=True), pd.DataFrame(audit_rows)
 
-    col_order += [
-        "Carry_Factor", "xW", "Win_Luck",
-        "Quality_SOS_Rank", "Quality_SOS",
-        "Score_Floor", "Score_Ceiling", "Consistency",
-        "Avg_Teammate_Rank", "Avg_Opponent_Rank", "Schedule_Advantage", "SOS_Rank", "Lucky_Factor"
-    ]
+def get_archived_tournaments():
+    valid_exts = (".csv", ".xlsx", ".xls")
+    if not os.path.exists(TOURNAMENTS_DIR):
+        return []
+    return sorted([f for f in os.listdir(TOURNAMENTS_DIR) if f.lower().endswith(valid_exts)])
 
-    df_final = df_ranks[[c for c in col_order if c in df_ranks.columns]].sort_values("Actual_Rank").reset_index(drop=True)
-    df_audit = pd.DataFrame(audit_rows)
-    return df_final, df_audit
+def load_tournament_file(filepath):
+    df = parse_file(filepath)
+    df.columns = [str(c).strip() for c in df.columns]
+    is_raw_match = any("match" in c.lower() for c in df.columns) and any("red" in c.lower() for c in df.columns)
+    if is_raw_match:
+        df_analyzed, _ = analyze_tournament(df)
+        return df_analyzed
+    return df
 
-# ==========================================
-# MULTI-EVENT SEASON DATA LOADER
-# ==========================================
-def load_all_season_event_data():
-    events = get_available_events()
-    all_dfs = []
-    processed_events = set()
-
-    for ev in events:
-        ev_key = ev.lower()
-        if ev_key in processed_events:
+def load_all_archived_teams():
+    all_files = get_archived_tournaments()
+    all_records = []
+    for f in all_files:
+        path = os.path.join(TOURNAMENTS_DIR, f)
+        try:
+            df = load_tournament_file(path)
+            if df is not None and "Team" in df.columns:
+                df["Tournament"] = os.path.splitext(f)[0]
+                all_records.append(df)
+        except Exception:
             continue
+    return pd.concat(all_records, ignore_index=True) if all_records else pd.DataFrame()
 
-        df_m, df_r = load_preloaded_event_files(ev)
-        if df_m is not None:
-            try:
-                df_res, _ = analyze_tournament(df_m, df_r, silent=True)
-                if df_res is not None and not df_res.empty:
-                    df_res["Tournament"] = ev.replace("_", " ").title()
-                    all_dfs.append(df_res)
-                    processed_events.add(ev_key)
-                    continue
-            except Exception:
-                pass
+# ==============================================================================
+# MODE 1: TM EVENT ANALYZER & ARCHIVE (API + UPLOAD SUPPORT)
+# ==============================================================================
+if app_mode == "📊 TM Event Analyzer & Archive":
+    st.subheader("📊 Tournament Manager Results, Analytics & Archival")
 
-        for f in os.listdir(TOURNAMENTS_DIR):
-            base, ext = os.path.splitext(f)
-            if ext.lower() == ".csv" and base.lower() == ev_key:
-                full_path = os.path.join(TOURNAMENTS_DIR, f)
-                try:
-                    df_saved = pd.read_csv(full_path)
-                    if "Team" in df_saved.columns and "Carry_Factor" in df_saved.columns:
-                        df_saved["Tournament"] = ev.replace("_", " ").title()
-                        all_dfs.append(df_saved)
-                        processed_events.add(ev_key)
-                        break
-                except Exception:
-                    continue
+    st.sidebar.header("📥 Ingestion Method")
+    ingest_source = st.sidebar.radio("Select Source:", ["API Sync (Instant)", "File Upload (.xlsx/.xls/.csv)", "Load From Archive"])
 
-    if all_dfs:
-        combined = pd.concat(all_dfs, ignore_index=True)
-        return combined.drop_duplicates(subset=["Tournament", "Team"])
-    return pd.DataFrame()
+    df_results = None
+    df_audit = None
 
-# ==========================================
-# MODE 1: TM EVENT ANALYZER & ARCHIVE
-# ==========================================
-if app_mode == "TM Event Analyzer & Archive":
-    st.subheader("Tournament Manager Results, Analytics & Archival")
-
-    # Glossary button row
-    col_hdr, col_btn = st.columns([3, 1])
-    with col_btn:
-        if st.button("📖 Metric Definitions & Glossary", key="m1_glossary_btn", use_container_width=True):
-            show_metric_glossary()
-
-    st.sidebar.header("📁 Load Saved Tournament")
-    available_events = get_available_events()
-    selected_event = st.sidebar.selectbox(
-        "Choose Archived Tournament (Most Recent First):",
-        ["-- Upload New Event Below --"] + available_events
-    )
-
-    st.sidebar.header("📤 Or Upload New Tournament")
-    uploaded_matches = st.sidebar.file_uploader("1. Match Results (.xlsx, .xls, .csv)", type=["xlsx", "xls", "csv"])
-    uploaded_rankings = st.sidebar.file_uploader("2. TM Rankings (.xlsx, .xls, .csv)", type=["xlsx", "xls", "csv"])
-    manual_overrides = st.sidebar.text_area(
-        "3. Overrides (Optional)",
-        placeholder="e.g.\nDQ: Qualifier #12, 2011B\nTie: Qualifier #58\nWinner: Qualifier #65, Blue"
-    )
-
-    df_m = None
-    df_r = None
-
-    if selected_event != "-- Upload New Event Below --":
-        df_m, df_r = load_preloaded_event_files(selected_event)
-        if df_m is not None:
-            st.sidebar.success(f"Loaded match data for **{selected_event}**")
-        if df_r is not None:
-            st.sidebar.success("Found & linked official TM Rankings!")
-        else:
-            st.sidebar.info("Running standalone on match score tallies.")
-    elif uploaded_matches is not None:
-        df_m = parse_file(uploaded_matches)
-        df_r = parse_file(uploaded_rankings) if uploaded_rankings is not None else None
-
-    if df_m is not None:
-        df_results, df_audit = analyze_tournament(df_m, df_r, manual_overrides, silent=False)
-
-        if df_results is not None:
-            c1, c2, c3, c4 = st.columns(4)
-            top_carry = df_results.sort_values("Carry_Factor", ascending=False).iloc[0]
-            hardest_qsos = df_results.sort_values("Quality_SOS", ascending=False).iloc[0]
-            most_luck = df_results.sort_values("Win_Luck", ascending=False).iloc[0]
-
-            champs = df_results[df_results["Playoff_Finish"] == "Champion"]["Team"].tolist()
-            champ_str = ", ".join(champs) if champs else "N/A (Quals Only)"
-
-            c1.metric("Tournament Champions", champ_str)
-            c2.metric("Highest Carry Factor", f"{top_carry['Team']} ({top_carry['Carry_Factor']})")
-            c3.metric("Hardest Quality SOS", f"{hardest_qsos['Team']} (+{hardest_qsos['Quality_SOS']})")
-            c4.metric("Highest Win Luck Delta", f"{most_luck['Team']} (+{most_luck['Win_Luck']} xW)")
-
-            # Mode 1 Tabs Navigation
-            tab_standings, tab_bracket, tab_audit = st.tabs([
-                "📊 Standings & Advanced Metrics",
-                "🏆 Elimination Bracket & Results",
-                "🔍 Single-Team Match Audit"
-            ])
-
-            # TAB 1: STANDINGS & METRICS BOARD
-            with tab_standings:
-                st.subheader("Tournament Advanced Metrics Board")
-                st.dataframe(df_results, use_container_width=True)
-
-                b_col1, b_col2 = st.columns([1, 1])
-                with b_col1:
-                    csv_data = df_results.to_csv(index=False).encode("utf-8")
-                    st.download_button("📥 Export Clean CSV", data=csv_data, file_name="tournament_analytics.csv", mime="text/csv")
-                with b_col2:
-                    if selected_event == "-- Upload New Event Below --":
-                        event_name = st.text_input("Archive Event Name:", value=f"Event_{datetime.now().strftime('%Y%m%d')}")
-                        if st.button("💾 Save Event to Tournament Archive"):
-                            save_path = os.path.join(TOURNAMENTS_DIR, f"{event_name.strip()}.csv")
-                            df_results.to_csv(save_path, index=False)
-                            st.success(f"Saved event to archive as {event_name.strip()}.csv!")
-                            st.rerun()
-
-            # TAB 2: ELIMINATION BRACKET & MATCH RESULTS
-            with tab_bracket:
-                df_elims, champs_list, finalists_list = parse_elimination_bracket(df_m)
-
-                if df_elims is None or df_elims.empty:
-                    st.info("ℹ️ No elimination matches found in this match export (this file contains qualification matches only).")
-                else:
-                    # Elimination podium banner
-                    p_c1, p_c2 = st.columns(2)
-                    with p_c1:
-                        if champs_list:
-                            st.success(f"🏆 **Tournament Champions:** Alliance **{' & '.join(champs_list)}**")
-                        else:
-                            st.info("🏆 **Tournament Champions:** Finals In Progress / Undetermined")
-                    with p_c2:
-                        if finalists_list:
-                            st.warning(f"🥈 **Tournament Finalists:** Alliance **{' & '.join(finalists_list)}**")
-                        else:
-                            st.info("🥈 **Tournament Finalists:** Undetermined")
-
-                    # Stage-by-stage display
-                    st.markdown("### ⚔️ Elimination Playoff Rounds")
-                    stages = ["Finals", "Semifinals", "Quarterfinals", "Round of 16"]
-                    found_any_stage = False
-
-                    for stage_name in stages:
-                        stage_matches = df_elims[df_elims["Stage"] == stage_name]
-                        if not stage_matches.empty:
-                            found_any_stage = True
-                            with st.expander(f"📌 {stage_name} ({len(stage_matches)} Match{'es' if len(stage_matches) > 1 else ''})", expanded=(stage_name in ["Finals", "Semifinals"])):
-                                st.dataframe(stage_matches[["Match", "Red Alliance", "Score", "Blue Alliance", "Winner", "Margin"]], use_container_width=True)
-
-                    if not found_any_stage:
-                        st.dataframe(df_elims[["Match", "Red Alliance", "Score", "Blue Alliance", "Winner", "Margin"]], use_container_width=True)
-
-                    st.markdown("---")
-                    st.markdown("### 📋 All Elimination Match Results")
-                    st.dataframe(df_elims, use_container_width=True)
-
-                    csv_elims = df_elims.to_csv(index=False).encode("utf-8")
-                    st.download_button("📥 Export Elimination Results CSV", data=csv_elims, file_name="elimination_bracket_results.csv", mime="text/csv")
-
-            # TAB 3: SINGLE-TEAM MATCH AUDIT
-            with tab_audit:
-                if df_audit is not None and not df_audit.empty:
-                    st.subheader("🔍 Single-Team Match Audit")
-                    team_list = df_results["Team"].tolist()
-                    sel_team = st.selectbox("Inspect Match Log for Team:", team_list)
-                    team_matches = df_audit[df_audit["Team"] == sel_team].reset_index(drop=True)
-                    st.dataframe(team_matches[["Match", "Alliance", "Partner", "Opponents", "Score", "Result", "Match_Leverage"]], use_container_width=True)
-                else:
-                    st.info("No audit rows generated for this tournament.")
-    else:
-        st.info("👈 Upload your Tournament Manager files or choose a preloaded tournament from the sidebar.")
-
-# ==========================================
-# MODE 2: SEASON HISTORICAL STATS & DOSSIERS
-# ==========================================
-elif app_mode == "Season Historical Stats & Dossiers":
-    st.subheader("📊 Overall Season Historical Team Analytics")
-    st.write("Aggregated season-wide performance metrics compiled across all analyzed tournament archives (ordered from newest to oldest).")
-
-    # Glossary button row
-    col_hdr, col_btn = st.columns([3, 1])
-    with col_btn:
-        if st.button("📖 Metric Definitions & Glossary", key="m2_glossary_btn", use_container_width=True):
-            show_metric_glossary()
-
-    df_season = load_all_season_event_data()
-
-    if df_season.empty:
-        st.info("No tournament archives found. Upload and link event files in Mode 1 to build season analytics.")
-    else:
-        agg_rows = []
-        for team, grp in df_season.groupby("Team"):
-            events_played = len(grp)
-            tot_wins = grp["Wins"].sum() if "Wins" in grp.columns else 0
-            tot_losses = grp["Losses"].sum() if "Losses" in grp.columns else 0
-            tot_ties = grp["Ties"].sum() if "Ties" in grp.columns else 0
-            tot_matches = tot_wins + tot_losses + tot_ties
-            win_pct = round(((tot_wins + 0.5 * tot_ties) / max(1, tot_matches)) * 100, 1)
-
-            avg_qual_rank = round(grp["Actual_Rank"].mean(), 1) if "Actual_Rank" in grp.columns else np.nan
-            best_qual_rank = int(grp["Actual_Rank"].min()) if "Actual_Rank" in grp.columns else np.nan
-
-            all_finishes = grp["Playoff_Finish"].dropna().tolist() if "Playoff_Finish" in grp.columns else []
-            valid_finishes = [f for f in all_finishes if f in PLAYOFF_ORDER and f != "-"]
-            best_playoff = min(valid_finishes, key=lambda x: PLAYOFF_ORDER[x]) if valid_finishes else "Quals"
-
-            mean_carry = round(grp["Carry_Factor"].mean(), 1) if "Carry_Factor" in grp.columns else np.nan
-            mean_qsos = round(grp["Quality_SOS"].mean(), 2) if "Quality_SOS" in grp.columns else np.nan
-            tot_xw = round(grp["xW"].sum(), 2) if "xW" in grp.columns else np.nan
-            tot_win_luck = round(grp["Win_Luck"].sum(), 2) if "Win_Luck" in grp.columns else np.nan
-
-            mean_floor = int(round(grp["Score_Floor"].mean())) if "Score_Floor" in grp.columns else np.nan
-            mean_ceil = int(round(grp["Score_Ceiling"].mean())) if "Score_Ceiling" in grp.columns else np.nan
-            mean_cons = int(round(grp["Consistency"].mean())) if "Consistency" in grp.columns else np.nan
-
-            mean_ap = round(grp["AP"].mean(), 1) if "AP" in grp.columns else np.nan
-            mean_sp = round(grp["SP"].mean(), 1) if "SP" in grp.columns else np.nan
-            tot_awp = int(grp["AWP"].sum()) if "AWP" in grp.columns else 0
-
-            agg_rows.append({
-                "Team": team,
-                "Events_Played": events_played,
-                "Record": f"{tot_wins}-{tot_losses}-{tot_ties}",
-                "Win_Pct": win_pct,
-                "Best_Playoff_Finish": best_playoff,
-                "Best_Qual_Rank": f"#{best_qual_rank}",
-                "Avg_Qual_Rank": avg_qual_rank,
-                "Mean_Carry_Factor": mean_carry,
-                "Total_xW": tot_xw,
-                "Total_Win_Luck": tot_win_luck,
-                "Avg_Quality_SOS": mean_qsos,
-                "Avg_Score_Floor": mean_floor,
-                "Avg_Score_Ceiling": mean_ceil,
-                "Avg_Consistency": f"{mean_cons}%",
-                "Mean_AP": mean_ap,
-                "Total_AWP": tot_awp,
-                "Mean_SP": mean_sp,
-                "_sort_playoff": PLAYOFF_ORDER.get(best_playoff, 99)
-            })
-
-        df_leaderboard = pd.DataFrame(agg_rows)
-
-        flt_col1, flt_col2, flt_col3 = st.columns([1, 1, 2])
-        with flt_col1:
-            min_ev = st.number_input("Minimum Events Attended:", min_value=1, max_value=max(1, int(df_leaderboard["Events_Played"].max())), value=1, step=1)
-        with flt_col2:
-            sort_by = st.selectbox(
-                "Sort Leaderboard By:",
-                ["Mean_Carry_Factor", "Total_xW", "Win_Pct", "Avg_Quality_SOS", "Avg_Score_Ceiling", "Best_Playoff_Finish", "Best_Qual_Rank", "Avg_Qual_Rank", "Mean_AP"],
-                index=0
-            )
-        with flt_col3:
-            search_query = st.text_input("Filter by Team #:", placeholder="e.g. 2011, 6741, 6978").strip().upper()
-
-        filtered_df = df_leaderboard[df_leaderboard["Events_Played"] >= min_ev].copy()
-        if search_query:
-            filtered_df = filtered_df[filtered_df["Team"].str.contains(search_query, na=False)]
-
-        sort_col = "_sort_playoff" if sort_by == "Best_Playoff_Finish" else sort_by
-        ascending = True if sort_by in ["Avg_Qual_Rank", "Best_Playoff_Finish", "Best_Qual_Rank"] else False
-        filtered_df = filtered_df.sort_values(by=[sort_col], ascending=[ascending]).reset_index(drop=True)
-        display_df = filtered_df.drop(columns=["_sort_playoff"])
-        display_df.index = display_df.index + 1
-
-        st.dataframe(display_df, use_container_width=True)
-
-        csv_season = display_df.to_csv(index=False).encode("utf-8")
-        st.download_button("📥 Export Season Leaderboard CSV", data=csv_season, file_name="season_historical_leaderboard.csv", mime="text/csv")
-
-        # Individual Team Season Dossier
-        st.markdown("---")
-        st.subheader("🔍 Individual Team Season Dossier & History Log")
-        all_teams_list = sorted(df_leaderboard["Team"].tolist())
-        selected_team = st.selectbox("Select Team to Inspect:", all_teams_list)
-
-        t_records = df_season[df_season["Team"] == selected_team].reset_index(drop=True)
-        t_summary = df_leaderboard[df_leaderboard["Team"] == selected_team].iloc[0]
-
-        d_c1, d_c2, d_c3, d_c4, d_c5, d_c6 = st.columns(6)
-        d_c1.metric("Events Attended", t_summary["Events_Played"])
-        d_c2.metric("Best Qual Seed", t_summary["Best_Qual_Rank"])
-        d_c3.metric("Best Playoff Finish", t_summary["Best_Playoff_Finish"])
-        d_c4.metric("Season Record", t_summary["Record"], f"{t_summary['Win_Pct']}% Win Rate")
-        d_c5.metric("Mean Carry Factor", t_summary["Mean_Carry_Factor"])
-        d_c6.metric("Expected Wins (xW)", f"{t_summary['Total_xW']}", f"Luck: {'+' if t_summary['Total_Win_Luck'] >= 0 else ''}{t_summary['Total_Win_Luck']}")
-
-        d2_c1, d2_c2, d2_c3 = st.columns(3)
-        d2_c1.metric("Avg Quality SOS", f"{t_summary['Avg_Quality_SOS']}")
-        d2_c2.metric("Floor / Ceiling", f"{t_summary['Avg_Score_Floor']} - {t_summary['Avg_Score_Ceiling']}")
-        d2_c3.metric("Consistency Rating", t_summary["Avg_Consistency"])
-
-        st.markdown(f"#### **{selected_team}** Tournament Log *(Recent First)*")
-        log_cols = [c for c in [
-            "Tournament", "Actual_Rank", "Playoff_Finish", "WP", "AP", "SP", "AWP",
-            "Carry_Factor", "xW", "Win_Luck", "Quality_SOS", "Score_Floor", "Score_Ceiling", "Consistency"
-        ] if c in t_records.columns]
-        st.dataframe(t_records[log_cols], use_container_width=True)
-
-# ==========================================
-# MODE 3: TOP 25 COMMUNITY VOTING & CONSENSUS
-# ==========================================
-elif app_mode == "Top 25 Poll & Community Rankings":
-    cycle_id, cycle_label, next_reset_str = get_current_poll_cycle()
-
-    st.subheader("🏆 V5RC Community Top 25 Power Rankings Portal")
-
-    s_col1, s_col2 = st.columns([2, 1])
-    with s_col1:
-        st.markdown(f"**Current Poll Cycle:** `{cycle_label}` *(Resets weekly on Sunday @ 12:01 AM EST)*")
-    with s_col2:
-        st.caption(f"⏳ **Next Poll Reset:** {next_reset_str}")
-
-    tab_ballot, tab_consensus = st.tabs(["🗳️ Submit Top 25 Ballot", "📊 Consensus Power Rankings"])
-    df_season = load_all_season_event_data()
-
-    team_stat_map = {}
-    known_teams = []
-    if not df_season.empty:
-        for team, grp in df_season.groupby("Team"):
-            tot_wins = grp["Wins"].sum() if "Wins" in grp.columns else 0
-            tot_losses = grp["Losses"].sum() if "Losses" in grp.columns else 0
-            tot_ties = grp["Ties"].sum() if "Ties" in grp.columns else 0
-            rec = f"{tot_wins}-{tot_losses}-{tot_ties}"
-
-            all_finishes = grp["Playoff_Finish"].dropna().tolist() if "Playoff_Finish" in grp.columns else []
-            valid_finishes = [f for f in all_finishes if f in PLAYOFF_ORDER and f != "-"]
-            best_playoff = min(valid_finishes, key=lambda x: PLAYOFF_ORDER[x]) if valid_finishes else "Quals"
-            best_seed = int(grp["Actual_Rank"].min()) if "Actual_Rank" in grp.columns else "?"
-
-            mean_cf = round(grp["Carry_Factor"].mean(), 1) if "Carry_Factor" in grp.columns else "?"
-            tot_xw = round(grp["xW"].sum(), 1) if "xW" in grp.columns else "?"
-            tot_luck = round(grp["Win_Luck"].sum(), 1) if "Win_Luck" in grp.columns else "?"
-            mean_qsos = round(grp["Quality_SOS"].mean(), 1) if "Quality_SOS" in grp.columns else "?"
-            mean_ap = round(grp["AP"].mean(), 1) if "AP" in grp.columns else "?"
-
-            team_stat_map[team] = {
-                "display": f"{team} • {rec} • {best_playoff} (#{best_seed}) • CF: {mean_cf} • xW: {tot_xw} (Luck: {tot_luck})",
-                "record": rec,
-                "best_playoff": best_playoff,
-                "best_seed": f"#{best_seed}",
-                "mean_cf": mean_cf,
-                "tot_xw": tot_xw,
-                "tot_luck": tot_luck,
-                "mean_qsos": mean_qsos,
-                "mean_ap": mean_ap,
-                "events": len(grp)
-            }
-        known_teams = sorted(list(team_stat_map.keys()))
-
-    with tab_ballot:
-        st.markdown(f"### Cast Your Top 25 Ballot — {cycle_label}")
-        st.caption("Use the Live Scouting Cheatsheet on the right to evaluate team records, Carry Factors, and Expected Wins while voting.")
-
-        col_ballot, col_scout = st.columns([1.1, 0.9])
-
-        with col_ballot:
-            st.markdown("#### 1. Voter Information")
-            voter_name = st.text_input("Voter Name / Handle *", placeholder="e.g., BuckeyeScout / Coach Smith")
-            affiliation = st.text_input("Voter Affiliation / Region (Optional)", placeholder="e.g., Ohio / Team 2011")
-
-            st.markdown("#### 2. Select Ranks #1 through #25")
-            ballot_choices = {}
-            team_dropdown_options = ["-- Select Team --"] + known_teams
-
-            def format_team_option(t):
-                if t == "-- Select Team --":
-                    return "-- Select Team --"
-                return team_stat_map.get(t, {}).get("display", t)
-
-            b_left, b_right = st.columns(2)
-            for r in range(1, 26):
-                target_col = b_left if r <= 13 else b_right
-                with target_col:
-                    if known_teams:
-                        val = st.selectbox(
-                            f"#{r} Rank",
-                            team_dropdown_options,
-                            format_func=format_team_option,
-                            key=f"poll_rank_{r}"
-                        )
-                        if val != "-- Select Team --":
-                            ballot_choices[r] = val
-                    else:
-                        val = st.text_input(f"#{r} Rank Team #", key=f"poll_rank_{r}")
-                        if val.strip():
-                            ballot_choices[r] = val.strip().upper()
-
-            picked_teams = list(ballot_choices.values())
-            duplicates = {}
-            for rank_num, t_val in ballot_choices.items():
-                if picked_teams.count(t_val) > 1:
-                    duplicates.setdefault(t_val, []).append(f"#{rank_num}")
-
-            st.markdown("---")
-            if duplicates:
-                for dup_team, ranks in duplicates.items():
-                    st.error(f"❌ **Duplicate Selection:** Team **{dup_team}** is chosen at {', '.join(ranks)}. Each rank must be unique.")
-            elif len(picked_teams) < 25:
-                st.warning(f"⚠️ Ballot incomplete: **{len(picked_teams)} of 25** teams ranked.")
+    if ingest_source == "API Sync (Instant)":
+        st.sidebar.markdown("### ⚡ Live VEX API Sync")
+        api_event_id = st.sidebar.text_input("Event ID / SKU:", placeholder="e.g. 65708 or RE-V5RC-26-XXXX")
+        if st.sidebar.button("⚡ Fetch & Analyze Event"):
+            if api_event_id.strip():
+                with st.spinner("Connecting to VEX API..."):
+                    try:
+                        df_m = api_client.get_event_matches(api_event_id.strip())
+                        try:
+                            df_r = api_client.get_event_rankings(api_event_id.strip())
+                        except Exception:
+                            df_r = None
+                        df_results, df_audit = analyze_tournament(df_m, df_r)
+                        st.sidebar.success("Event synced from API!")
+                    except Exception as e:
+                        st.sidebar.error(f"API Error: {str(e)}")
             else:
-                st.success("✅ Ballot complete: All 25 unique teams selected!")
+                st.sidebar.warning("Enter a valid Event ID.")
 
-            submit_disabled = bool(duplicates) or (len(picked_teams) < 25) or (not voter_name.strip())
+    elif ingest_source == "Load From Archive":
+        st.sidebar.markdown("### 📁 Archive Presets")
+        archived_files = get_archived_tournaments()
+        if archived_files:
+            selected_archive = st.sidebar.selectbox("Choose Saved Tournament:", archived_files)
+            if selected_archive:
+                archive_path = os.path.join(TOURNAMENTS_DIR, selected_archive)
+                with st.spinner(f"Loading {selected_archive}..."):
+                    df_results = load_tournament_file(archive_path)
+                st.info(f"Loaded tournament archive: **{selected_archive}**")
+        else:
+            st.sidebar.info("No archives found in `data/tournaments/`.")
 
-            if st.button("🗳️ Submit Top 25 Ballot", disabled=submit_disabled, use_container_width=True):
-                new_ballot = {
-                    "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "Cycle_ID": cycle_id,
-                    "Cycle_Label": cycle_label,
-                    "Voter": voter_name.strip(),
-                    "Affiliation": affiliation.strip()
-                }
-                for rank_num, team_val in ballot_choices.items():
-                    new_ballot[f"Rank_{rank_num}"] = team_val
+    else:
+        st.sidebar.markdown("### 📤 File Uploads")
+        uploaded_matches = st.sidebar.file_uploader("1. Match Results (.xlsx, .xls, .csv)", type=["xlsx", "xls", "csv"])
+        uploaded_rankings = st.sidebar.file_uploader("2. TM Rankings (.xlsx, .xls, .csv)", type=["xlsx", "xls", "csv"])
+        manual_overrides = st.sidebar.text_area("3. Overrides (Optional)", placeholder="e.g.\nTie: Qualifier #58\nDQ: Qualifier #12, Red")
+        
+        if uploaded_matches is not None:
+            with st.spinner("Processing Tournament Data..."):
+                df_m = parse_file(uploaded_matches)
+                df_r = parse_file(uploaded_rankings) if uploaded_rankings is not None else None
+                df_results, df_audit = analyze_tournament(df_m, df_r, manual_overrides)
 
-                df_new = pd.DataFrame([new_ballot])
-                if os.path.exists(BALLOTS_FILE):
-                    df_new.to_csv(BALLOTS_FILE, mode="a", header=False, index=False)
-                else:
-                    df_new.to_csv(BALLOTS_FILE, index=False)
+    if df_results is not None:
+        c1, c2, c3 = st.columns(3)
+        top_carry = df_results.sort_values("Carry_Factor", ascending=False).iloc[0]
+        luckiest = df_results.sort_values("Lucky_Factor", ascending=False).iloc[0]
+        hardest_sos = df_results.sort_values("SOS_Rank").iloc[0]
+        
+        c1.metric("Highest Carry Factor", f"{top_carry['Team']} ({top_carry['Carry_Factor']})")
+        c2.metric("Luckiest Schedule Draw", f"{luckiest['Team']} ({luckiest['Lucky_Factor']})")
+        c3.metric("Hardest Schedule (#1 SOS)", f"{hardest_sos['Team']}")
 
-                st.success(f"🎉 Ballot submitted successfully for **{cycle_label}**!")
+        st.subheader("Tournament Advanced Metrics Board")
+        st.dataframe(df_results, use_container_width=True)
+
+        b_col1, b_col2 = st.columns([1, 1])
+        with b_col1:
+            csv_data = df_results.to_csv(index=False).encode("utf-8")
+            st.download_button("📥 Export Clean CSV", data=csv_data, file_name="tournament_analytics.csv", mime="text/csv")
+        with b_col2:
+            event_name = st.text_input("Archive Event Name:", value=f"Event_{datetime.now().strftime('%Y%m%d_%H%M')}")
+            if st.button("💾 Save Event to Tournament Archive"):
+                save_path = os.path.join(TOURNAMENTS_DIR, f"{event_name.strip()}.csv")
+                df_results.to_csv(save_path, index=False)
+                st.success(f"Saved event to archive as `{event_name.strip()}.csv`!")
                 st.rerun()
 
-        with col_scout:
-            st.markdown("#### 📋 Live Scouting Reference Cheatsheet")
-            st.caption("Inspect team performance across past competitions to evaluate rankings.")
+# ==============================================================================
+# MODE 2: TOP 25 COMMUNITY VOTING & CONSENSUS POLL
+# ==============================================================================
+elif app_mode == "🗳️ Top 25 Poll & Community Rankings":
+    st.subheader("🗳️ V5RC Community Top 25 Power Rankings Portal")
+    st.write("Submit your Top 25 ballot using aggregated tournament resumes, or inspect the live community consensus leaderboard.")
 
-            if team_stat_map:
-                scout_rows = []
-                for t, info in team_stat_map.items():
-                    scout_rows.append({
-                        "Team": t,
-                        "Record": info["record"],
-                        "Best_Finish": info["best_playoff"],
-                        "Best_Seed": info["best_seed"],
-                        "Carry_Factor": info["mean_cf"],
-                        "Total_xW": info["tot_xw"],
-                        "Win_Luck": info["tot_luck"],
-                        "Quality_SOS": info["mean_qsos"],
-                        "Events": info["events"]
-                    })
-                df_scout = pd.DataFrame(scout_rows)
+    tab_ballot, tab_consensus, tab_dossier = st.tabs(["✍️ Submit Top 25 Ballot", "🏆 Consensus Power Rankings", "🔎 Team Season Resumes"])
 
-                ref_tab_table, ref_tab_dossier = st.tabs(["📊 Quick Stats Table", "🔍 Team Dossier Card"])
+    df_global = load_all_archived_teams()
+    known_teams = sorted(df_global["Team"].unique().tolist()) if not df_global.empty else []
 
-                with ref_tab_table:
-                    s_filter = st.text_input("🔍 Quick Filter Team:", placeholder="e.g. 2011, 6741").strip().upper()
-                    s_sort = st.selectbox("Sort Reference By:", ["Carry_Factor", "Total_xW", "Quality_SOS", "Best_Finish", "Record"], index=0)
+    with tab_ballot:
+        st.markdown("### 📋 Official Top 25 Ballot")
+        voter_name = st.text_input("Voter Name / Handle:", placeholder="e.g. BuckeyeScout / Coach Smith")
+        affiliation = st.text_input("Voter Affiliation / Region (Optional):", placeholder="e.g. Ohio / Team 2011")
+        st.caption("Select your ranked 1 to 25 teams. Each team must be unique.")
 
-                    df_scout_filtered = df_scout.copy()
-                    if s_filter:
-                        df_scout_filtered = df_scout_filtered[df_scout_filtered["Team"].str.contains(s_filter, na=False)]
+        ballot_choices = {}
+        cols = st.columns(2)
+        for r in range(1, 26):
+            target_col = cols[0] if r <= 13 else cols[1]
+            with target_col:
+                if known_teams:
+                    options = ["-- Select Team --"] + known_teams
+                    val = st.selectbox(f"#{r} Rank", options, key=f"poll_rank_{r}")
+                    if val != "-- Select Team --":
+                        ballot_choices[r] = val
+                else:
+                    val = st.text_input(f"#{r} Rank Team #", key=f"poll_rank_{r}")
+                    if val.strip():
+                        ballot_choices[r] = val.strip().upper()
 
-                    if s_sort in ["Carry_Factor", "Total_xW", "Quality_SOS"]:
-                        df_scout_filtered = df_scout_filtered.sort_values(by=[s_sort], ascending=False)
+        picked_teams = list(ballot_choices.values())
+        duplicates = [t for t in set(picked_teams) if picked_teams.count(t) > 1]
+        submit_disabled = bool(duplicates) or (len(picked_teams) < 25) or (not voter_name.strip())
 
-                    st.dataframe(df_scout_filtered, use_container_width=True, height=520)
+        if duplicates:
+            st.error(f"❌ Duplicate teams selected: {', '.join(duplicates)}. Each rank must be a unique team.")
+        elif len(picked_teams) < 25:
+            st.warning(f"⚠️ Ballot incomplete: {len(picked_teams)} of 25 teams selected.")
 
-                with ref_tab_dossier:
-                    ins_team = st.selectbox("Inspect Dossier for Team:", known_teams, key="dossier_side_inspect")
-                    t_info = team_stat_map.get(ins_team, {})
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Record", t_info.get("record", "?"))
-                    c2.metric("Best Finish", t_info.get("best_playoff", "?"))
-                    c3.metric("Carry Factor", t_info.get("mean_cf", "?"))
+        if st.button("📤 Submit Top 25 Ballot", disabled=submit_disabled):
+            new_ballot = {
+                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "Voter": voter_name.strip(),
+                "Affiliation": affiliation.strip()
+            }
+            for rank_num, team_val in ballot_choices.items():
+                new_ballot[f"Rank_{rank_num}"] = team_val
 
-                    st.write(f"**Expected Wins:** {t_info.get('tot_xw', '?')} (Luck: {t_info.get('tot_luck', '?')}) | **Quality SOS:** {t_info.get('mean_qsos', '?')}")
-                    t_logs = df_season[df_season["Team"] == ins_team]
-                    st.dataframe(t_logs[[c for c in ["Tournament", "Actual_Rank", "Playoff_Finish", "Carry_Factor", "xW", "Win_Luck", "Quality_SOS", "WP", "SP"] if c in t_logs.columns]], use_container_width=True)
+            df_new = pd.DataFrame([new_ballot])
+            if os.path.exists(BALLOTS_FILE):
+                df_new.to_csv(BALLOTS_FILE, mode="a", header=False, index=False)
             else:
-                st.info("No tournament data loaded yet. Upload and link event files in Mode 1 to populate this cheatsheet.")
+                df_new.to_csv(BALLOTS_FILE, index=False)
+
+            st.success("✅ Ballot submitted successfully and factored into the consensus rankings!")
+            st.rerun()
 
     with tab_consensus:
-        st.markdown("### Community Consensus Top 25 Leaderboard")
-        st.caption("Scoring (Borda Count): #1 = 25 pts, #2 = 24 pts, down to #25 = 1 pt.")
+        st.markdown("### 🏆 Community Consensus Top 25 Leaderboard")
+        st.caption("Borda Count Scoring: #1 = 25 pts, #2 = 24 pts, down to #25 = 1 pt.")
 
         if os.path.exists(BALLOTS_FILE) and os.path.getsize(BALLOTS_FILE) > 0:
-            df_all_ballots = pd.read_csv(BALLOTS_FILE)
+            df_ballots = pd.read_csv(BALLOTS_FILE)
+            st.metric("Total Ballots Submitted", len(df_ballots))
 
-            if "Cycle_ID" not in df_all_ballots.columns:
-                df_all_ballots["Cycle_ID"] = cycle_id
-                df_all_ballots["Cycle_Label"] = cycle_label
+            borda_scores = {}
+            ballot_counts = {}
+            ranks_list = {}
 
-            available_cycles = sorted(df_all_ballots["Cycle_ID"].dropna().unique().tolist(), reverse=True)
-            if cycle_id not in available_cycles:
-                available_cycles.insert(0, cycle_id)
+            for _, row in df_ballots.iterrows():
+                for r in range(1, 26):
+                    col_name = f"Rank_{r}"
+                    if col_name in row and pd.notna(row[col_name]):
+                        t = str(row[col_name]).strip()
+                        pts = 26 - r
+                        borda_scores[t] = borda_scores.get(t, 0) + pts
+                        ballot_counts[t] = ballot_counts.get(t, 0) + 1
+                        ranks_list.setdefault(t, []).append(r)
 
-            sel_cycle = st.selectbox(
-                "Select Voting Week / Poll Cycle:",
-                available_cycles,
-                format_func=lambda cid: f"🟢 {cycle_label} (ACTIVE WEEK)" if cid == cycle_id else f"📁 {cid} (Archived Week)",
-                index=0
-            )
-
-            df_cycle_ballots = df_all_ballots[df_all_ballots["Cycle_ID"] == sel_cycle]
-
-            if not df_cycle_ballots.empty:
-                st.metric("Total Ballots Submitted This Week", len(df_cycle_ballots))
-
-                borda_scores = {}
-                ballot_counts = {}
-                ranks_list = {}
-
-                for _, row in df_cycle_ballots.iterrows():
-                    for r in range(1, 26):
-                        col_name = f"Rank_{r}"
-                        if col_name in row and pd.notna(row[col_name]):
-                            t = str(row[col_name]).strip()
-                            pts = 26 - r
-                            borda_scores[t] = borda_scores.get(t, 0) + pts
-                            ballot_counts[t] = ballot_counts.get(t, 0) + 1
-                            ranks_list.setdefault(t, []).append(r)
-
-                consensus_rows = []
-                for t, total_pts in borda_scores.items():
-                    consensus_rows.append({
-                        "Team": t,
-                        "Total_Points": total_pts,
-                        "Ballots_Appeared": ballot_counts[t],
-                        "Avg_Rank": round(np.mean(ranks_list[t]), 1),
-                        "Best_Rank": min(ranks_list[t])
-                    })
-
-                df_consensus = pd.DataFrame(consensus_rows)
-                df_consensus = df_consensus.sort_values(by=["Total_Points", "Ballots_Appeared", "Avg_Rank"], ascending=[False, False, True]).reset_index(drop=True)
-                df_consensus.index = df_consensus.index + 1
-                df_consensus.index.name = "Consensus_Rank"
-                df_consensus = df_consensus.reset_index()
-
-                st.dataframe(df_consensus.head(25), use_container_width=True)
-
-                with st.expander("👁️ View All Submitted Ballots for This Cycle"):
-                    st.dataframe(df_cycle_ballots, use_container_width=True)
-            else:
-                st.info(f"🗳️ A fresh voting cycle has opened for **{cycle_label}** (opened Sunday @ 12:01 AM EST). No ballots have been submitted yet this week — be the first to cast your vote!")
-        else:
-            st.info(f"No ballots submitted yet for **{cycle_label}**. Head over to the 'Submit Top 25 Ballot' tab to cast the first ballot!")
-
-# ==========================================
-# MODE 4: FUTURE TOURNAMENT SANDBOX
-# ==========================================
-elif app_mode == "Future Tournament Sandbox":
-    st.subheader("Upcoming Event Predictions, Validation & Mock Alliance Selection")
-    st.write("Input projected tournament stats below. The integrity engine verifies mathematical tournament legality before generating brackets.")
-
-    col_up1, col_up2, col_up3 = st.columns([2, 1, 1])
-    with col_up1:
-        uploaded_teams = st.file_uploader("Upload Registered Teams List (.csv or .xlsx)", type=["csv", "xlsx", "xls"])
-    with col_up2:
-        st.write("")
-        st.write("")
-        use_template = st.button("Load Sample 16-Team Roster")
-    with col_up3:
-        target_matches = st.number_input("Scheduled Matches / Team:", min_value=2, max_value=12, value=6, step=1)
-
-    if uploaded_teams is not None:
-        df_raw_teams = parse_file(uploaded_teams)
-        df_raw_teams.columns = [str(c).strip() for c in df_raw_teams.columns]
-        team_col = next((c for c in df_raw_teams.columns if "team" in c.lower() and "name" not in c.lower()), df_raw_teams.columns[0])
-        name_col = next((c for c in df_raw_teams.columns if "name" in c.lower()), None)
-
-        base_teams = []
-        for _, row in df_raw_teams.iterrows():
-            t_num = str(row[team_col]).strip()
-            t_name = str(row[name_col]).strip() if name_col else f"Team {t_num}"
-            if t_num and t_num.lower() != "nan":
-                base_teams.append({
-                    "Team": t_num, "Name": t_name,
-                    "Wins": int(row.get("Wins", target_matches // 2)),
-                    "Losses": int(row.get("Losses", target_matches // 2)),
-                    "Ties": int(row.get("Ties", 0)),
-                    "AWP": int(row.get("AWP", 0)),
-                    "AP": int(row.get("AP", 24)),
-                    "SP": int(row.get("SP", 120))
+            consensus_rows = []
+            for t, total_pts in borda_scores.items():
+                consensus_rows.append({
+                    "Team": t,
+                    "Total_Points": total_pts,
+                    "Ballots_Appeared": ballot_counts[t],
+                    "Avg_Rank": round(np.mean(ranks_list[t]), 1),
+                    "Best_Rank": min(ranks_list[t])
                 })
-        initial_df = pd.DataFrame(base_teams)
+
+            df_consensus = pd.DataFrame(consensus_rows)
+            df_consensus = df_consensus.sort_values(by=["Total_Points", "Ballots_Appeared", "Avg_Rank"], ascending=[False, False, True]).reset_index(drop=True)
+            df_consensus.index = df_consensus.index + 1
+            df_consensus.index.name = "Consensus_Rank"
+            df_consensus = df_consensus.reset_index()
+
+            st.dataframe(df_consensus.head(25), use_container_width=True)
+
+            with st.expander("🗳️ View All Submitted Ballots"):
+                st.dataframe(df_ballots, use_container_width=True)
+        else:
+            st.info("No ballots submitted yet. Submit the first ballot in the 'Submit Top 25 Ballot' tab!")
+
+    with tab_dossier:
+        st.markdown("### 🔎 Season Team Dossiers & Performance History")
+        if not df_global.empty:
+            inspect_team = st.selectbox("Select Team to Inspect:", known_teams)
+            team_records = df_global[df_global["Team"] == inspect_team]
+
+            t_c1, t_c2, t_c3, t_c4 = st.columns(4)
+            t_c1.metric("Events Attended", len(team_records))
+            t_c2.metric("Best Finish", f"#{int(team_records['Actual_Rank'].min())}")
+            t_c3.metric("Avg Finish", f"#{team_records['Actual_Rank'].mean():.1f}")
+            if "Carry_Factor" in team_records.columns:
+                t_c4.metric("Mean Carry Factor", f"{team_records['Carry_Factor'].mean():.1f}")
+
+            st.markdown("#### Tournament History Breakdown")
+            display_cols = [c for c in ["Tournament", "Actual_Rank", "WP", "AP", "SP", "Carry_Factor", "SOS_Rank", "Lucky_Factor"] if c in team_records.columns]
+            st.dataframe(team_records[display_cols].reset_index(drop=True), use_container_width=True)
+        else:
+            st.info("No tournament archives found. Add `.xls`, `.xlsx`, or `.csv` files to `data/tournaments/` or save an event in Mode 1.")
+
+# ==============================================================================
+# MODE 3: FUTURE TOURNAMENT SANDBOX (API TEAM ROSTER LOAD)
+# ==============================================================================
+elif app_mode == "🔮 Future Tournament Sandbox":
+    st.subheader("🔮 Upcoming Event Predictions & Alliance Draft Room")
+    target_matches = st.sidebar.number_input("Scheduled Matches / Team:", min_value=2, max_value=12, value=6, step=1)
+    
+    col_sb1, col_sb2 = st.columns([1, 1])
+    with col_sb1:
+        use_template = st.button("📋 Load Sample 16-Team Roster")
+    with col_sb2:
+        api_sandbox_event = st.text_input("Or Pull Registered Roster via API Event ID:")
+        pull_roster_btn = st.button("⚡ Fetch Team List")
+
+    if pull_roster_btn and api_sandbox_event.strip():
+        try:
+            df_fetched_teams = api_client.get_event_teams(api_sandbox_event.strip())
+            initial_df = pd.DataFrame([{
+                "Team": r["Team"], "Name": r["Name"],
+                "Wins": target_matches // 2, "Losses": target_matches // 2, "Ties": 0,
+                "AWP": 0, "AP": 24, "SP": 120
+            } for _, r in df_fetched_teams.iterrows()])
+            st.success(f"Fetched {len(initial_df)} registered teams via API!")
+        except Exception as e:
+            st.error(f"API Fetch Error: {str(e)}")
+            initial_df = pd.DataFrame([("Team A", "Alpha", 4, 2, 0, 1, 36, 150)], columns=["Team", "Name", "Wins", "Losses", "Ties", "AWP", "AP", "SP"])
     elif use_template:
         sample_teams = [
             ("6978K", "Dysfunctional", 6, 0, 0, 1, 48, 140),
@@ -1395,11 +604,8 @@ elif app_mode == "Future Tournament Sandbox":
         ]
         initial_df = pd.DataFrame(default_teams, columns=["Team", "Name", "Wins", "Losses", "Ties", "AWP", "AP", "SP"])
 
-    st.markdown("### Step 1: Input / Edit Projected Stats")
     edited_df = st.data_editor(
-        initial_df,
-        num_rows="dynamic",
-        use_container_width=True,
+        initial_df, num_rows="dynamic", use_container_width=True,
         column_config={
             "Team": st.column_config.TextColumn("Team #", required=True),
             "Name": st.column_config.TextColumn("Team Name"),
@@ -1427,33 +633,19 @@ elif app_mode == "Future Tournament Sandbox":
     ap_unit = target_matches * 6
 
     validation_errors = []
-    validation_warnings = []
-
     if tot_wins != tot_losses:
         validation_errors.append(f"❌ **Wins/Losses Imbalance:** Total Wins ({tot_wins}) does not equal Total Losses ({tot_losses}).")
     if tot_wins % 2 != 0:
         validation_errors.append(f"❌ **Odd Win Count:** Total Wins ({tot_wins}) must be an even number.")
     if tot_losses % 2 != 0:
         validation_errors.append(f"❌ **Odd Loss Count:** Total Losses ({tot_losses}) must be an even number.")
-    if tot_ties % 4 != 0:
-        validation_warnings.append(f"⚠️ **Ties Non-Divisible by 4:** Total Ties across the field is {tot_ties} (since each tie awards 4 team ties).")
     if tot_ap % ap_unit != 0:
-        validation_errors.append(f"❌ **Overall AP Rule Violation:** Total field AP ({tot_ap}) must be a multiple of ({target_matches} matches × 6 = {ap_unit}).")
+        validation_errors.append(f"❌ **AP Divisibility Error:** Total AP ({tot_ap}) must be a multiple of ({target_matches} × 6) = **{ap_unit}**.")
 
-    st.markdown("#### Tournament Legality Status")
-    v_col1, v_col2, v_col3, v_col4 = st.columns(4)
-    v_col1.metric("Total Field Wins", tot_wins, f"{'Balanced' if tot_wins == tot_losses else f'Diff: {tot_wins - tot_losses}'}")
-    v_col2.metric("Total Field Losses", tot_losses, f"{'Even' if tot_losses % 2 == 0 else 'Odd (Invalid)'}")
-    v_col3.metric("Total Field Ties", tot_ties, f"{'Multiple of 4' if tot_ties % 4 == 0 else 'Non-Multiple'}")
-    v_col4.metric("Total Field AP", tot_ap, f"{'Valid' if tot_ap % ap_unit == 0 else 'Invalid Multiple'}")
-
-    if not validation_errors and not validation_warnings:
-        st.success("✅ **Tournament Math Verified:** All parity, evenness, and AP multiples constraints pass.")
-    else:
-        for err in validation_errors:
-            st.error(err)
-        for warn in validation_warnings:
-            st.warning(warn)
+    for err in validation_errors:
+        st.error(err)
+    if not validation_errors:
+        st.success("✅ Tournament Math Verified: All parity and AP multiples pass.")
 
     pred_data["WP"] = (pred_data["Wins"] * 2) + pred_data["Ties"] + pred_data["AWP"]
     pred_standings = pred_data.sort_values(by=["WP", "AP", "SP"], ascending=[False, False, False]).reset_index(drop=True)
@@ -1461,30 +653,28 @@ elif app_mode == "Future Tournament Sandbox":
     pred_standings.index.name = "Predicted_Rank"
     pred_standings = pred_standings.reset_index()
 
-    st.markdown("### Step 2: Predicted Official Leaderboard")
+    st.markdown("### 🏆 Predicted Leaderboard")
     st.dataframe(pred_standings[["Predicted_Rank", "Team", "Name", "Wins", "Losses", "Ties", "WP", "AP", "SP"]], use_container_width=True)
 
-    st.markdown("---")
-    st.markdown("### Step 3: Interactive Alliance Selection Draft Room")
+    st.markdown("### 🤝 Interactive Alliance Selection Draft Room")
     all_teams_list = pred_standings["Team"].tolist()
     available_pool = all_teams_list.copy()
 
     col_d1, col_d2 = st.columns([1, 2])
     with col_d1:
-        max_possible = 16 if len(all_teams_list) >= 32 else (8 if len(all_teams_list) >= 16 else max(2, len(all_teams_list) // 2))
-        num_alliances = st.selectbox("Number of Alliances:", [8, 16] if len(all_teams_list) >= 32 else ([8] if len(all_teams_list) >= 16 else [max_possible]), index=0)
+        num_alliances = st.selectbox("Number of Alliances:", [8, 16] if len(all_teams_list) >= 32 else [8 if len(all_teams_list) >= 16 else max(2, len(all_teams_list)//2)])
         auto_draft = st.checkbox("Auto-Draft highest remaining seeds", value=False)
 
     alliances = []
     for a_num in range(1, num_alliances + 1):
-        if not available_pool:
-            break
+        if not available_pool: break
         captain = available_pool.pop(0)
         if auto_draft:
             partner = available_pool.pop(0) if available_pool else "(None)"
         else:
             partner_options = ["Select Partner..."] + available_pool
-            partner_pick = st.selectbox(f"Alliance #{a_num} Captain: {captain}", partner_options, key=f"draft_{a_num}")
+            st.markdown(f"**Alliance #{a_num} Captain: `{captain}`**")
+            partner_pick = st.selectbox(f"Partner for Alliance #{a_num}:", partner_options, key=f"draft_{a_num}")
             if partner_pick != "Select Partner..." and partner_pick in available_pool:
                 available_pool.remove(partner_pick)
                 partner = partner_pick
@@ -1494,24 +684,4 @@ elif app_mode == "Future Tournament Sandbox":
         alliances.append({"Alliance": a_num, "Captain": captain, "Partner": partner})
 
     df_alliances = pd.DataFrame(alliances)
-    st.markdown("#### Drafted Elimination Alliances")
     st.dataframe(df_alliances, use_container_width=True)
-
-    st.markdown("#### Projected Playoff Bracket Matchups")
-    bracket_pairs = []
-    half = num_alliances // 2
-    for i in range(half):
-        seed_top = i + 1
-        seed_bot = num_alliances - i
-        top_row = df_alliances[df_alliances["Alliance"] == seed_top].iloc[0]
-        bot_row = df_alliances[df_alliances["Alliance"] == seed_bot].iloc[0]
-        bracket_pairs.append({
-            "Match": f"Quarterfinal {i+1}" if num_alliances == 8 else f"Round of 16 Match {i+1}",
-            "High Seed": f"Alliance {seed_top} ({top_row['Captain']} & {top_row['Partner']})",
-            "vs": "VS",
-            "Low Seed": f"Alliance {seed_bot} ({bot_row['Captain']} & bot_row['Partner'])"
-        })
-    st.dataframe(pd.DataFrame(bracket_pairs), use_container_width=True)
-
-    csv_alliances = df_alliances.to_csv(index=False).encode("utf-8")
-    st.download_button("📥 Export Drafted Alliances CSV", data=csv_alliances, file_name="drafted_alliances.csv", mime="text/csv")
