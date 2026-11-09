@@ -22,83 +22,81 @@ os.makedirs(BALLOTS_DIR, exist_ok=True)
 # ==========================================
 # REST API CLIENT (VEX / 3145H AXUM SPEC)
 # ==========================================
+# ==========================================
+# REST API CLIENT (VEX / 3145H AXUM SPEC)
+# ==========================================
 class VexApiClient:
-    def __init__(self, base_url: str = None, api_key: str = None):
-        self.base_url = (base_url or st.secrets.get("VEX_API_BASE_URL", "https://api.3145h.org/v1")).rstrip("/")
-        self.api_key = api_key or st.secrets.get("VEX_API_KEY", "")
+    def __init__(self):
+        # Hidden and locked behind the scenes
+        self.base_url = st.secrets.get("VEX_API_BASE_URL", "https://api.3145h.org/v1").rstrip("/")
+        self.api_key = st.secrets.get("VEX_API_KEY", "")
         self.session = requests.Session()
         if self.api_key:
-            self.session.headers.update({"Authorization": f"Bearer {self.api_key}"})
-
-    def set_config(self, base_url: str, api_key: str = None):
-        if base_url:
-            self.base_url = base_url.rstrip("/")
-        if api_key:
-            self.api_key = api_key
             self.session.headers.update({"Authorization": f"Bearer {self.api_key}"})
 
     def _get(self, endpoint: str, params: dict = None) -> dict:
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
         try:
-            res = self.session.get(url, params=params or {}, timeout=12)
+            res = self.session.get(url, params=params or {}, timeout=15)
             res.raise_for_status()
             return res.json()
         except requests.exceptions.ConnectionError:
-            raise ConnectionError(f"Could not connect to API server at '{self.base_url}'. Verify endpoint is reachable.")
+            raise ConnectionError(f"Could not connect to API server at '{self.base_url}'.")
         except requests.exceptions.HTTPError as e:
-            raise RuntimeError(f"API returned HTTP {res.status_code}: {res.text}")
+            raise RuntimeError(f"API returned HTTP {res.status_code}")
 
     def resolve_event(self, event_query: str) -> tuple[int, str]:
         """Resolves an Event SKU or numeric ID to (numeric_id, event_name)."""
         query = str(event_query).strip()
         
-        # 1. If user passed a numeric ID directly
+        # Numeric ID direct pass
         if query.isdigit():
             try:
                 res = self._get(f"/events/{query}")
-                data = res.get("data", res)
-                name = data.get("name", f"Event #{query}")
+                data = res.get("data", res) if isinstance(res, dict) else res
+                name = data.get("name", f"Event #{query}") if isinstance(data, dict) else f"Event #{query}"
                 return int(query), name
             except Exception:
                 return int(query), f"Event #{query}"
 
-        # 2. If user passed a SKU (e.g. RE-V5RC-26-XXXX)
-        params_attempts = [{"sku": query}, {"sku[]": query}]
-        for p in params_attempts:
+        # SKU search
+        for p in [{"sku": query}, {"sku[]": query}]:
             try:
                 res = self._get("/events", params=p)
-                items = res.get("data", [])
-                if items:
+                items = res.get("data", res) if isinstance(res, dict) else res
+                if isinstance(items, list) and len(items) > 0:
                     ev = items[0]
                     return int(ev["id"]), ev.get("name", query)
             except Exception:
                 continue
 
-        # Fallback: Try raw endpoint
+        # Fallback raw query
         try:
             res = self._get(f"/events/{query}")
-            ev = res.get("data", res)
-            if "id" in ev:
+            ev = res.get("data", res) if isinstance(res, dict) else res
+            if isinstance(ev, dict) and "id" in ev:
                 return int(ev["id"]), ev.get("name", query)
         except Exception:
             pass
 
-        raise ValueError(f"Could not resolve SKU or Event ID '{query}'. Please verify the SKU format.")
+        raise ValueError(f"Could not resolve SKU or Event ID '{query}'.")
 
     def get_event_teams(self, event_id: int) -> pd.DataFrame:
         all_teams = []
         page = 1
         while True:
-            payload = self._get(f"/events/{event_id}/teams", params={"page": page, "per_page": 50})
-            data = payload.get("data", [])
+            payload = self._get(f"/events/{event_id}/teams", params={"page": page, "per_page": 100})
+            data = payload.get("data", payload) if isinstance(payload, dict) else payload
+            if not isinstance(data, list) or not data:
+                break
             for t in data:
                 all_teams.append({
                     "Team": t.get("number", ""),
-                    "Name": t.get("team_name", ""),
+                    "Name": t.get("team_name", t.get("name", "")),
                     "Organization": t.get("organization", ""),
-                    "City": t.get("location", {}).get("city", "")
+                    "City": t.get("location", {}).get("city", "") if isinstance(t.get("location"), dict) else ""
                 })
-            pagination = payload.get("pagination", {})
+            pagination = payload.get("pagination", {}) if isinstance(payload, dict) else {}
             if page >= pagination.get("total_pages", 1):
                 break
             page += 1
@@ -107,34 +105,38 @@ class VexApiClient:
     def get_event_matches(self, event_id: int) -> pd.DataFrame:
         all_matches = []
         page = 1
+        
+        def extract_team_num(t_obj):
+            if isinstance(t_obj, str): return t_obj.strip()
+            if isinstance(t_obj, dict):
+                inner = t_obj.get("team", t_obj)
+                if isinstance(inner, dict):
+                    return str(inner.get("number") or inner.get("name") or inner.get("id") or "").strip()
+                return str(inner).strip()
+            return str(t_obj).strip()
+
         while True:
-            payload = self._get(f"/events/{event_id}/matches", params={"page": page, "per_page": 50})
-            data = payload.get("data", [])
-            if not data:
+            payload = self._get(f"/events/{event_id}/matches", params={"page": page, "per_page": 100})
+            data = payload.get("data", payload) if isinstance(payload, dict) else payload
+            if not isinstance(data, list) or not data:
                 break
                 
             for m in data:
-                # Accept round 2 (standard quals) or if match label indicates qualifier
                 m_name = m.get("name", f"Qualifier #{m.get('matchnum', '')}")
-                rnd = m.get("round", 2)
-                if rnd not in [2, "2"] and "qual" not in m_name.lower():
+                
+                # Exclude elimination matches; include standard qual formats
+                is_elim = any(x in m_name.lower() for x in ["round of 16", "quarterfinal", "semifinal", "final", "qf", "sf", "f#"])
+                if is_elim:
                     continue
 
                 alliances = m.get("alliances", [])
-                red = next((a for a in alliances if a.get("color", "").lower() == "red"), {})
-                blue = next((a for a in alliances if a.get("color", "").lower() == "blue"), {})
+                red = next((a for a in alliances if str(a.get("color", "")).lower() == "red"), {})
+                blue = next((a for a in alliances if str(a.get("color", "")).lower() == "blue"), {})
                 
-                # Robust team identifier extraction
-                red_teams = []
-                for t in red.get("teams", []):
-                    team_obj = t.get("team", t)
-                    red_teams.append(team_obj.get("name", team_obj.get("number", "")))
-                
-                blue_teams = []
-                for t in blue.get("teams", []):
-                    team_obj = t.get("team", t)
-                    blue_teams.append(team_obj.get("name", team_obj.get("number", "")))
+                red_teams = [extract_team_num(t) for t in red.get("teams", []) if extract_team_num(t)]
+                blue_teams = [extract_team_num(t) for t in blue.get("teams", []) if extract_team_num(t)]
 
+                # Accept 2v2 matches with valid scores
                 if len(red_teams) >= 2 and len(blue_teams) >= 2:
                     r_sc = float(red.get("score", 0.0))
                     b_sc = float(blue.get("score", 0.0))
@@ -151,7 +153,7 @@ class VexApiClient:
                         "Winner": winner
                     })
 
-            pagination = payload.get("pagination", {})
+            pagination = payload.get("pagination", {}) if isinstance(payload, dict) else {}
             if page >= pagination.get("total_pages", 1):
                 break
             page += 1
@@ -160,21 +162,24 @@ class VexApiClient:
 
     def get_event_rankings(self, event_id: int) -> pd.DataFrame:
         payload = self._get(f"/events/{event_id}/rankings")
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
         rows = []
-        for r in payload.get("data", []):
-            team_info = r.get("team", {})
-            t_num = team_info.get("name", team_info.get("number", r.get("team_number", "")))
-            rows.append({
-                "Actual_Rank": r.get("rank"),
-                "Team": t_num,
-                "WP": r.get("wp", 0),
-                "AP": r.get("ap", 0),
-                "SP": r.get("sp", 0),
-                "Wins": r.get("wins", 0),
-                "Losses": r.get("losses", 0),
-                "Ties": r.get("ties", 0)
-            })
+        if isinstance(data, list):
+            for r in data:
+                team_info = r.get("team", {})
+                t_num = team_info.get("number", team_info.get("name", r.get("team_number", ""))) if isinstance(team_info, dict) else str(team_info)
+                rows.append({
+                    "Actual_Rank": r.get("rank"),
+                    "Team": str(t_num).strip(),
+                    "WP": r.get("wp", 0),
+                    "AP": r.get("ap", 0),
+                    "SP": r.get("sp", 0),
+                    "Wins": r.get("wins", 0),
+                    "Losses": r.get("losses", 0),
+                    "Ties": r.get("ties", 0)
+                })
         return pd.DataFrame(rows)
+
 api_client = VexApiClient()
 
 # ==========================================
@@ -440,24 +445,24 @@ if app_mode == "📊 TM Event Analyzer & Archive":
 
     if ingest_source == "API Sync (Instant)":
         st.sidebar.markdown("### ⚡ Live VEX API Sync")
-        api_event_input = st.sidebar.text_input("Event SKU or ID:", placeholder="e.g. RE-V5RC-26-4576 or 65708")
-        
-        with st.sidebar.expander("⚙️ API Server Connection Settings"):
-            custom_url = st.text_input("API Base URL:", value=st.secrets.get("VEX_API_BASE_URL", "https://api.3145h.org/v1"))
-            custom_key = st.text_input("API Key (Bearer Token):", value=st.secrets.get("VEX_API_KEY", ""), type="password")
+        api_event_input = st.sidebar.text_input("Event SKU or ID:", placeholder="e.g. RE-V5RC-26-4758")
 
         if st.sidebar.button("⚡ Fetch & Analyze Event"):
             if api_event_input.strip():
-                api_client.set_config(custom_url.strip(), custom_key.strip())
-                with st.spinner("Resolving event and streaming matches from API..."):
+                with st.spinner("Connecting to live tournament database..."):
                     try:
                         numeric_id, event_title = api_client.resolve_event(api_event_input.strip())
-                        st.sidebar.info(f"Connected to: **{event_title}** (ID: {numeric_id})")
+                        st.sidebar.success(f"Connected: **{event_title}**")
                         
                         df_m = api_client.get_event_matches(numeric_id)
                         
                         if df_m.empty:
-                            st.sidebar.warning(f"⚠️ Event found ({event_title}), but 0 completed qualification matches are published in the API yet.")
+                            st.sidebar.warning(f"⚠️ **{event_title}** has no played qualification matches published in the API yet.")
+                            
+                            # Check if teams are registered so user can predict
+                            df_t = api_client.get_event_teams(numeric_id)
+                            if not df_t.empty:
+                                st.sidebar.info(f"💡 Found **{len(df_t)} registered teams** for this upcoming event. You can run mock predictions in the Sandbox tab.")
                         else:
                             try:
                                 df_r = api_client.get_event_rankings(numeric_id)
@@ -468,12 +473,11 @@ if app_mode == "📊 TM Event Analyzer & Archive":
                             st.session_state["df_results"] = res
                             st.session_state["df_audit"] = audit
                             st.session_state["loaded_source_label"] = f"{event_title} (ID: {numeric_id})"
-                            st.sidebar.success(f"Loaded {len(df_m)} matches across {len(res)} teams!")
                             st.rerun()
                     except Exception as e:
                         st.sidebar.error(f"Sync Failed: {str(e)}")
             else:
-                st.sidebar.warning("Enter a valid Event ID or SKU.")
+                st.sidebar.warning("Please enter a valid Event SKU or ID.")
 
     elif ingest_source == "Load From Archive":
         st.sidebar.markdown("### 📁 Archive Presets")
