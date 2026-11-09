@@ -103,123 +103,97 @@ class VexApiClient:
 
     def get_event_matches(self, event_id: str | int) -> tuple[pd.DataFrame, dict]:
         """
-        Fetches event matches by discovering all division IDs for the event.
-        Returns (DataFrame, debug_info_dict).
+        Fetches event matches and parses the Axum API schema (separate 'red'/'blue' objects).
         """
         debug_log = {
             "event_id": str(event_id),
-            "discovered_divisions": [],
-            "endpoints_probed": [],
             "raw_match_count": 0,
-            "sample_raw_match": None
         }
 
-        # 1. Discover Division IDs from /events/{event_id}
-        division_ids = []
-        try:
-            ev_res = self._get(f"/events/{event_id}")
-            ev_obj = ev_res.get("data", ev_res) if isinstance(ev_res, dict) else ev_res
-            if isinstance(ev_obj, dict):
-                divs = ev_obj.get("divisions", [])
-                if isinstance(divs, list):
-                    for d in divs:
-                        if isinstance(d, dict) and "id" in d:
-                            division_ids.append(d["id"])
-                            debug_log["discovered_divisions"].append({"id": d["id"], "name": d.get("name")})
-                        elif isinstance(d, (int, str)):
-                            division_ids.append(d)
-        except Exception as e:
-            debug_log["event_fetch_error"] = str(e)
-
-        # 2. Build team ID -> Number mapping
-        id_to_num = {}
-        try:
-            raw_t = self._get(f"/events/{event_id}/teams", params={"per_page": 100})
-            t_list = raw_t.get("data", raw_t) if isinstance(raw_t, dict) else raw_t
-            if isinstance(t_list, list):
-                for item in t_list:
-                    if isinstance(item, dict):
-                        t_id = str(item.get("id", ""))
-                        t_num = str(item.get("number", item.get("team_name", ""))).strip()
-                        if t_id and t_num:
-                            id_to_num[t_id] = t_num
-        except Exception:
-            pass
-
-        def resolve_num(val):
-            if val is None:
-                return ""
-            if isinstance(val, dict):
-                inner = val.get("team", val)
-                if isinstance(inner, dict):
-                    v = inner.get("number") or inner.get("name") or inner.get("id") or ""
-                    return id_to_num.get(str(v).strip(), str(v).strip())
-                return id_to_num.get(str(inner).strip(), str(inner).strip())
-            s = str(val).strip()
-            return id_to_num.get(s, s)
-
-        # 3. Assemble candidate endpoints
-        endpoints_to_try = []
-        for div in division_ids:
-            endpoints_to_try.append((f"/events/{event_id}/divisions/{div}/matches", {}))
-            endpoints_to_try.append((f"/events/{event_id}/matches", {"division": div}))
-            endpoints_to_try.append((f"/events/{event_id}/matches", {"division_id": div}))
-
-        endpoints_to_try.extend([
+        # Probe match endpoints
+        endpoints_to_try = [
             (f"/events/{event_id}/matches", {}),
-            (f"/events/{event_id}/matches", {"division_id": 1}),
-            (f"/events/{event_id}/matches", {"division": 1}),
+            (f"/events/{event_id}/matches", {"per_page": 250}),
             (f"/events/{event_id}/divisions/1/matches", {}),
-            (f"/events/{event_id}/divisions/2/matches", {}),
-        ])
+        ]
 
         raw_match_list = []
         for ep, ep_params in endpoints_to_try:
             try:
-                debug_log["endpoints_probed"].append({"url": ep, "params": ep_params})
-                payload = self._get(ep, params={**ep_params, "per_page": 100})
+                payload = self._get(ep, params={**ep_params, "per_page": 250})
                 data = payload.get("data", payload) if isinstance(payload, dict) else payload
                 if isinstance(data, list) and len(data) > 0:
-                    raw_match_list.extend(data)
+                    raw_match_list = data
+                    break
             except Exception:
                 continue
 
-        # Deduplicate matches
-        seen_matches = set()
-        unique_matches = []
-        for m in raw_match_list:
-            if isinstance(m, dict):
-                m_uid = str(m.get("id") or m.get("name") or (m.get("round"), m.get("matchnum")))
-                if m_uid not in seen_matches:
-                    seen_matches.add(m_uid)
-                    unique_matches.append(m)
-
-        debug_log["raw_match_count"] = len(unique_matches)
-        if unique_matches:
-            debug_log["sample_raw_match"] = unique_matches[0]
-
-        if not unique_matches:
+        debug_log["raw_match_count"] = len(raw_match_list)
+        if not raw_match_list:
             return pd.DataFrame(), debug_log
 
-        # 4. Parse matches into standard schema
+        # Parse matches into standard analytics format
         all_matches = []
-        for m in unique_matches:
-            m_name = str(m.get("name") or f"Qualifier #{m.get('matchnum', '')}").strip()
-            m_lower = m_name.lower()
-
-            if any(x in m_lower for x in ["round of 16", "quarterfinal", "semifinal", "final", "qf", "sf", "f#"]):
+        for m in raw_match_list:
+            if not isinstance(m, dict):
                 continue
+
+            stage = str(m.get("stage", "")).lower()
+            m_name = m.get("name")
+            m_num = m.get("match_number") or m.get("matchnum") or m.get("instance") or len(all_matches) + 1
+
+            # Skip elimination matches
+            if "elim" in stage or any(x in str(m_name).lower() for x in ["round of 16", "quarterfinal", "semifinal", "final", "qf", "sf", "f#"]):
+                continue
+
+            if not m_name:
+                m_name = f"Qualifier #{m_num}"
 
             r1, r2, b1, b2 = "", "", "", ""
             r_sc, b_sc = 0.0, 0.0
 
-            # Format A: RobotEvents alliances structure
-            if "alliances" in m and isinstance(m["alliances"], list):
+            # 1. Axum schema: 'red' and 'blue' dictionary blocks
+            if isinstance(m.get("red"), dict) and isinstance(m.get("blue"), dict):
+                red_obj = m["red"]
+                blue_obj = m["blue"]
+
+                r_teams = [
+                    str(t.get("number") or t.get("name") or t.get("id", "")).strip() 
+                    for t in red_obj.get("teams", []) if isinstance(t, dict)
+                ]
+                b_teams = [
+                    str(t.get("number") or t.get("name") or t.get("id", "")).strip() 
+                    for t in blue_obj.get("teams", []) if isinstance(t, dict)
+                ]
+
+                if len(r_teams) >= 2:
+                    r1, r2 = r_teams[0], r_teams[1]
+                elif len(r_teams) == 1:
+                    r1, r2 = r_teams[0], r_teams[0]
+
+                if len(b_teams) >= 2:
+                    b1, b2 = b_teams[0], b_teams[1]
+                elif len(b_teams) == 1:
+                    b1, b2 = b_teams[0], b_teams[0]
+
+                r_sc = float(red_obj.get("score", 0.0))
+                b_sc = float(blue_obj.get("score", 0.0))
+
+            # 2. Fallback: RobotEvents 'alliances' list
+            elif "alliances" in m and isinstance(m["alliances"], list):
                 red = next((a for a in m["alliances"] if isinstance(a, dict) and str(a.get("color", "")).lower() == "red"), {})
                 blue = next((a for a in m["alliances"] if isinstance(a, dict) and str(a.get("color", "")).lower() == "blue"), {})
 
-                r_teams = [resolve_num(t) for t in red.get("teams", []) if resolve_num(t)]
-                b_teams = [resolve_num(t) for t in blue.get("teams", []) if resolve_num(t)]
+                def get_team_num(t):
+                    if isinstance(t, dict):
+                        inner = t.get("team", t)
+                        if isinstance(inner, dict):
+                            return str(inner.get("number") or inner.get("name") or inner.get("id", "")).strip()
+                        return str(inner).strip()
+                    return str(t).strip()
+
+                r_teams = [get_team_num(t) for t in red.get("teams", []) if get_team_num(t)]
+                b_teams = [get_team_num(t) for t in blue.get("teams", []) if get_team_num(t)]
 
                 if len(r_teams) >= 2:
                     r1, r2 = r_teams[0], r_teams[1]
@@ -234,18 +208,16 @@ class VexApiClient:
                 r_sc = float(red.get("score") or red.get("points") or 0.0)
                 b_sc = float(blue.get("score") or blue.get("points") or 0.0)
 
-            # Format B: Flat keys
+            # 3. Fallback: Flat match keys
             else:
-                r1 = resolve_num(m.get("red_1") or m.get("red1") or m.get("red_team_1"))
-                r2 = resolve_num(m.get("red_2") or m.get("red2") or m.get("red_team_2"))
-                b1 = resolve_num(m.get("blue_1") or m.get("blue1") or m.get("blue_team_1"))
-                b2 = resolve_num(m.get("blue_2") or m.get("blue2") or m.get("blue_team_2"))
-                r_sc = float(m.get("red_score") or m.get("redscore") or m.get("red_points") or 0.0)
-                b_sc = float(m.get("blue_score") or m.get("bluescore") or m.get("blue_points") or 0.0)
+                r1 = str(m.get("red_1") or m.get("red1") or "").strip()
+                r2 = str(m.get("red_2") or m.get("red2") or r1).strip()
+                b1 = str(m.get("blue_1") or m.get("blue1") or "").strip()
+                b2 = str(m.get("blue_2") or m.get("blue2") or b1).strip()
+                r_sc = float(m.get("red_score") or m.get("redscore") or 0.0)
+                b_sc = float(m.get("blue_score") or m.get("bluescore") or 0.0)
 
             if r1 and b1:
-                if not r2: r2 = r1
-                if not b2: b2 = b1
                 winner = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
                 all_matches.append({
                     "Match": m_name,
