@@ -19,15 +19,9 @@ os.makedirs(BALLOTS_DIR, exist_ok=True)
 # ==========================================
 # REST API CLIENT (VEX / 3145H AXUM SPEC)
 # ==========================================
-# ==========================================
-# REST API CLIENT (VEX / 3145H AXUM SPEC)
-# ==========================================
-# ==========================================
-# REST API CLIENT (VEX / 3145H AXUM SPEC)
-# ==========================================
 class VexApiClient:
     def __init__(self):
-        # Hidden and locked behind the scenes
+        # Locked in background; never exposed to user UI
         self.base_url = st.secrets.get("VEX_API_BASE_URL", "https://api.3145h.org/v1").rstrip("/")
         self.api_key = st.secrets.get("VEX_API_KEY", "")
         self.session = requests.Session()
@@ -45,43 +39,48 @@ class VexApiClient:
         except requests.exceptions.HTTPError as e:
             raise RuntimeError(f"API returned HTTP {res.status_code}")
 
-    def resolve_event(self, event_query: str) -> tuple[int, str]:
-        """Resolves an Event SKU or numeric ID to (numeric_id, event_name)."""
+    def resolve_event(self, event_query: str) -> tuple[str, str]:
+        """
+        Resolves an Event SKU or numeric ID to (event_identifier, event_name).
+        Guarantees that a random first event is never returned by mistake.
+        """
         query = str(event_query).strip()
-        
-        # Numeric ID direct pass
-        if query.isdigit():
-            try:
-                res = self._get(f"/events/{query}")
-                data = res.get("data", res) if isinstance(res, dict) else res
-                name = data.get("name", f"Event #{query}") if isinstance(data, dict) else f"Event #{query}"
-                return int(query), name
-            except Exception:
-                return int(query), f"Event #{query}"
+        query_upper = query.upper()
 
-        # SKU search
-        for p in [{"sku": query}, {"sku[]": query}]:
-            try:
-                res = self._get("/events", params=p)
-                items = res.get("data", res) if isinstance(res, dict) else res
-                if isinstance(items, list) and len(items) > 0:
-                    ev = items[0]
-                    return int(ev["id"]), ev.get("name", query)
-            except Exception:
-                continue
-
-        # Fallback raw query
+        # 1. Try direct lookup via /events/{id_or_sku}
         try:
             res = self._get(f"/events/{query}")
-            ev = res.get("data", res) if isinstance(res, dict) else res
-            if isinstance(ev, dict) and "id" in ev:
-                return int(ev["id"]), ev.get("name", query)
+            data = res.get("data", res) if isinstance(res, dict) else res
+            if isinstance(data, dict) and ("id" in data or "sku" in data):
+                name = data.get("name", f"Event {query}")
+                target_id = str(data.get("id", query))
+                return target_id, name
         except Exception:
             pass
 
-        raise ValueError(f"Could not resolve SKU or Event ID '{query}'.")
+        # 2. Search /events collection with strict SKU/code matching
+        for param_key in ["sku", "sku[]", "code", "search"]:
+            try:
+                res = self._get("/events", params={param_key: query})
+                items = res.get("data", res) if isinstance(res, dict) else res
+                if isinstance(items, list):
+                    for ev in items:
+                        if isinstance(ev, dict):
+                            ev_sku = str(ev.get("sku", "")).strip().upper()
+                            ev_code = str(ev.get("code", "")).strip().upper()
+                            if query_upper in [ev_sku, ev_code]:
+                                return str(ev.get("id", query)), ev.get("name", query)
+            except Exception:
+                continue
 
-    def get_event_teams(self, event_id: int) -> pd.DataFrame:
+        # 3. Numeric ID direct pass
+        if query.isdigit():
+            return query, f"Event #{query}"
+
+        # 4. Fallback: pass input directly to sub-endpoints
+        return query, query
+
+    def get_event_teams(self, event_id: str | int) -> pd.DataFrame:
         all_teams = []
         page = 1
         while True:
@@ -102,10 +101,10 @@ class VexApiClient:
             page += 1
         return pd.DataFrame(all_teams)
 
-    def get_event_matches(self, event_id: int) -> pd.DataFrame:
+    def get_event_matches(self, event_id: str | int) -> pd.DataFrame:
         all_matches = []
         page = 1
-        
+
         def extract_team_num(t_obj):
             if isinstance(t_obj, str): return t_obj.strip()
             if isinstance(t_obj, dict):
@@ -124,7 +123,7 @@ class VexApiClient:
             for m in data:
                 m_name = m.get("name", f"Qualifier #{m.get('matchnum', '')}")
                 
-                # Exclude elimination matches; include standard qual formats
+                # Exclude elimination matches
                 is_elim = any(x in m_name.lower() for x in ["round of 16", "quarterfinal", "semifinal", "final", "qf", "sf", "f#"])
                 if is_elim:
                     continue
@@ -136,7 +135,6 @@ class VexApiClient:
                 red_teams = [extract_team_num(t) for t in red.get("teams", []) if extract_team_num(t)]
                 blue_teams = [extract_team_num(t) for t in blue.get("teams", []) if extract_team_num(t)]
 
-                # Accept 2v2 matches with valid scores
                 if len(red_teams) >= 2 and len(blue_teams) >= 2:
                     r_sc = float(red.get("score", 0.0))
                     b_sc = float(blue.get("score", 0.0))
@@ -160,7 +158,7 @@ class VexApiClient:
             
         return pd.DataFrame(all_matches)
 
-    def get_event_rankings(self, event_id: int) -> pd.DataFrame:
+    def get_event_rankings(self, event_id: str | int) -> pd.DataFrame:
         payload = self._get(f"/events/{event_id}/rankings")
         data = payload.get("data", payload) if isinstance(payload, dict) else payload
         rows = []
@@ -251,7 +249,10 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
         st.error(f"Could not map match columns. Detected headers: {list(df_matches.columns)}")
         return None, None
 
-    qual_df = df_matches[df_matches[match_col].astype(str).str.startswith("Qualifier")].copy()
+    qual_df = df_matches[df_matches[match_col].astype(str).str.lower().str.contains("qual|q", regex=True)].copy()
+    if qual_df.empty:
+        qual_df = df_matches.copy()
+
     qual_df[r_score_col] = pd.to_numeric(qual_df[r_score_col], errors="coerce").fillna(0.0)
     qual_df[b_score_col] = pd.to_numeric(qual_df[b_score_col], errors="coerce").fillna(0.0)
     overrides = parse_manual_overrides(overrides_text)
@@ -262,7 +263,7 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
     all_teams = sorted([t for t in raw_teams if t and t.lower() != "nan" and not t.isdigit()])
 
     df_ranks = None
-    if df_rankings_file is not None:
+    if df_rankings_file is not None and not df_rankings_file.empty:
         df_rankings_file.columns = [str(c).strip() for c in df_rankings_file.columns]
         team_rk_col = next((c for c in df_rankings_file.columns if "team" in c.lower()), None)
         rk_col = next((c for c in df_rankings_file.columns if "rank" in c.lower()), None)
@@ -428,7 +429,6 @@ def load_all_archived_teams():
 if app_mode == "📊 TM Event Analyzer & Archive":
     st.subheader("📊 Tournament Manager Results, Analytics & Archival")
 
-    # Session State initialization
     if "df_results" not in st.session_state:
         st.session_state["df_results"] = None
     if "df_audit" not in st.session_state:
@@ -439,7 +439,7 @@ if app_mode == "📊 TM Event Analyzer & Archive":
     st.sidebar.header("📥 Ingestion Method")
     ingest_source = st.sidebar.radio(
         "Select Source:", 
-        ["File Upload (.xlsx/.xls/.csv)", "Load From Archive", "API Sync (Instant)"],
+        ["API Sync (Instant)", "File Upload (.xlsx/.xls/.csv)", "Load From Archive"],
         index=0
     )
 
@@ -451,28 +451,26 @@ if app_mode == "📊 TM Event Analyzer & Archive":
             if api_event_input.strip():
                 with st.spinner("Connecting to live tournament database..."):
                     try:
-                        numeric_id, event_title = api_client.resolve_event(api_event_input.strip())
+                        target_id, event_title = api_client.resolve_event(api_event_input.strip())
                         st.sidebar.success(f"Connected: **{event_title}**")
                         
-                        df_m = api_client.get_event_matches(numeric_id)
+                        df_m = api_client.get_event_matches(target_id)
                         
                         if df_m.empty:
-                            st.sidebar.warning(f"⚠️ **{event_title}** has no played qualification matches published in the API yet.")
-                            
-                            # Check if teams are registered so user can predict
-                            df_t = api_client.get_event_teams(numeric_id)
+                            st.sidebar.warning(f"⚠️ **{event_title}** has no qualification matches published in the API yet.")
+                            df_t = api_client.get_event_teams(target_id)
                             if not df_t.empty:
-                                st.sidebar.info(f"💡 Found **{len(df_t)} registered teams** for this upcoming event. You can run mock predictions in the Sandbox tab.")
+                                st.sidebar.info(f"💡 Found **{len(df_t)} registered teams** for this event. You can load this roster into the Sandbox.")
                         else:
                             try:
-                                df_r = api_client.get_event_rankings(numeric_id)
+                                df_r = api_client.get_event_rankings(target_id)
                             except Exception:
                                 df_r = None
                                 
                             res, audit = analyze_tournament(df_m, df_r)
                             st.session_state["df_results"] = res
                             st.session_state["df_audit"] = audit
-                            st.session_state["loaded_source_label"] = f"{event_title} (ID: {numeric_id})"
+                            st.session_state["loaded_source_label"] = f"{event_title} ({target_id})"
                             st.rerun()
                     except Exception as e:
                         st.sidebar.error(f"Sync Failed: {str(e)}")
@@ -512,7 +510,7 @@ if app_mode == "📊 TM Event Analyzer & Archive":
                     st.session_state["loaded_source_label"] = uploaded_matches.name
                     st.rerun()
 
-    # Main Dashboard Render
+    # Main Dashboard Display
     df_results = st.session_state["df_results"]
 
     if df_results is not None:
@@ -548,14 +546,14 @@ if app_mode == "📊 TM Event Analyzer & Archive":
         
         col_card1, col_card2, col_card3 = st.columns(3)
         with col_card1:
+            st.markdown("#### ⚡ Live API Sync")
+            st.caption("Enter a V5RC Event SKU or numeric ID to stream match schedules and rankings directly.")
+        with col_card2:
             st.markdown("#### 📤 File Upload")
             st.caption("Upload your raw Tournament Manager qualification match export (`.xlsx`, `.xls`, or `.csv`). Official rankings are optional.")
-        with col_card2:
+        with col_card3:
             st.markdown("#### 📁 Archive Presets")
             st.caption("Load any tournament previously saved or committed into the repository's `data/tournaments/` folder.")
-        with col_card3:
-            st.markdown("#### ⚡ Live API Sync")
-            st.caption("Enter a VEX Event ID / SKU to stream match schedules and official rankings directly.")
 
 # ==============================================================================
 # MODE 2: TOP 25 COMMUNITY VOTING & CONSENSUS POLL
@@ -692,18 +690,23 @@ elif app_mode == "🔮 Future Tournament Sandbox":
     with col_sb1:
         use_template = st.button("📋 Load Sample 16-Team Roster")
     with col_sb2:
-        api_sandbox_event = st.text_input("Or Pull Registered Roster via API Event ID:")
+        api_sandbox_event = st.text_input("Or Pull Registered Roster via API Event SKU/ID:")
         pull_roster_btn = st.button("⚡ Fetch Team List")
 
     if pull_roster_btn and api_sandbox_event.strip():
         try:
-            df_fetched_teams = api_client.get_event_teams(api_sandbox_event.strip())
-            initial_df = pd.DataFrame([{
-                "Team": r["Team"], "Name": r["Name"],
-                "Wins": target_matches // 2, "Losses": target_matches // 2, "Ties": 0,
-                "AWP": 0, "AP": 24, "SP": 120
-            } for _, r in df_fetched_teams.iterrows()])
-            st.success(f"Fetched {len(initial_df)} registered teams via API!")
+            target_id, _ = api_client.resolve_event(api_sandbox_event.strip())
+            df_fetched_teams = api_client.get_event_teams(target_id)
+            if not df_fetched_teams.empty:
+                initial_df = pd.DataFrame([{
+                    "Team": r["Team"], "Name": r["Name"],
+                    "Wins": target_matches // 2, "Losses": target_matches // 2, "Ties": 0,
+                    "AWP": 0, "AP": 24, "SP": 120
+                } for _, r in df_fetched_teams.iterrows()])
+                st.success(f"Fetched {len(initial_df)} registered teams via API!")
+            else:
+                st.warning("No registered teams found for that event.")
+                initial_df = pd.DataFrame([("Team A", "Alpha", 4, 2, 0, 1, 36, 150)], columns=["Team", "Name", "Wins", "Losses", "Ties", "AWP", "AP", "SP"])
         except Exception as e:
             st.error(f"API Fetch Error: {str(e)}")
             initial_df = pd.DataFrame([("Team A", "Alpha", 4, 2, 0, 1, 36, 150)], columns=["Team", "Name", "Wins", "Losses", "Ties", "AWP", "AP", "SP"])
@@ -764,7 +767,7 @@ elif app_mode == "🔮 Future Tournament Sandbox":
     tot_ap = int(pred_data["AP"].sum())
     ap_unit = target_matches * 6
 
-    # Validation Engine
+    # Validation Checks
     validation_errors = []
     if tot_wins != tot_losses:
         validation_errors.append(f"❌ **Wins/Losses Imbalance:** Total Wins ({tot_wins}) does not equal Total Losses ({tot_losses}).")
@@ -789,6 +792,7 @@ elif app_mode == "🔮 Future Tournament Sandbox":
     st.markdown("### 🏆 Predicted Leaderboard")
     st.dataframe(pred_standings[["Predicted_Rank", "Team", "Name", "Wins", "Losses", "Ties", "WP", "AP", "SP"]], use_container_width=True)
 
+    # Alliance Selection Draft Room
     st.markdown("### 🤝 Interactive Alliance Selection Draft Room")
     all_teams_list = pred_standings["Team"].tolist()
     available_pool = all_teams_list.copy()
