@@ -17,23 +17,50 @@ os.makedirs(TOURNAMENTS_DIR, exist_ok=True)
 os.makedirs(BALLOTS_DIR, exist_ok=True)
 
 # ==========================================
-# REST API CLIENT (AXUM / ROBOTEVENTS SPEC)
+# REST API CLIENT (VEX / 3145H AXUM SPEC)
 # ==========================================
 class VexApiClient:
     def __init__(self, base_url: str = None, api_key: str = None):
-        self.base_url = (base_url or st.secrets.get("VEX_API_BASE_URL", "http://localhost:3000/v1")).rstrip("/")
+        # Default directly to live 3145h endpoint
+        self.base_url = (base_url or st.secrets.get("VEX_API_BASE_URL", "https://api.3145h.org/v1")).rstrip("/")
         self.api_key = api_key or st.secrets.get("VEX_API_KEY", "")
         self.session = requests.Session()
         if self.api_key:
             self.session.headers.update({"Authorization": f"Bearer {self.api_key}"})
 
+    def set_config(self, base_url: str, api_key: str = None):
+        if base_url:
+            self.base_url = base_url.rstrip("/")
+        if api_key:
+            self.api_key = api_key
+            self.session.headers.update({"Authorization": f"Bearer {self.api_key}"})
+
     def _get(self, endpoint: str, params: dict = None) -> dict:
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
-        res = self.session.get(url, params=params or {}, timeout=12)
-        res.raise_for_status()
-        return res.json()
+        try:
+            res = self.session.get(url, params=params or {}, timeout=12)
+            res.raise_for_status()
+            return res.json()
+        except requests.exceptions.ConnectionError:
+            raise ConnectionError(f"Could not connect to API server at '{self.base_url}'. Verify endpoint is reachable.")
+        except requests.exceptions.HTTPError as e:
+            raise RuntimeError(f"API returned HTTP {res.status_code}: {res.text}")
 
-    def get_event_teams(self, event_id: str | int) -> pd.DataFrame:
+    def resolve_event_id(self, event_query: str) -> str:
+        """Resolves RE-V5RC-XX-XXXX SKUs to internal numeric Event IDs if needed."""
+        query = str(event_query).strip()
+        if query.upper().startswith("RE-"):
+            try:
+                res = self._get("/events", params={"sku": query})
+                data = res.get("data", [])
+                if data:
+                    return str(data[0].get("id", query))
+            except Exception:
+                pass
+        return query
+
+    def get_event_teams(self, event_query: str) -> pd.DataFrame:
+        event_id = self.resolve_event_id(event_query)
         all_teams = []
         page = 1
         while True:
@@ -52,7 +79,8 @@ class VexApiClient:
             page += 1
         return pd.DataFrame(all_teams)
 
-    def get_event_matches(self, event_id: str | int) -> pd.DataFrame:
+    def get_event_matches(self, event_query: str) -> pd.DataFrame:
+        event_id = self.resolve_event_id(event_query)
         all_matches = []
         page = 1
         while True:
@@ -87,7 +115,8 @@ class VexApiClient:
             page += 1
         return pd.DataFrame(all_matches)
 
-    def get_event_rankings(self, event_id: str | int) -> pd.DataFrame:
+    def get_event_rankings(self, event_query: str) -> pd.DataFrame:
+        event_id = self.resolve_event_id(event_query)
         payload = self._get(f"/events/{event_id}/rankings")
         rows = []
         for r in payload.get("data", []):
@@ -118,7 +147,7 @@ app_mode = st.sidebar.radio(
 )
 
 # ==========================================
-# FILE PARSER & ANALYTICAL ENGINE
+# FILE PARSER & CORE ANALYTICAL ENGINE
 # ==========================================
 def parse_file(file):
     if hasattr(file, "name"):
@@ -251,7 +280,7 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
         elif w not in ["Red", "Blue", "Tie"]:
             w = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
 
-        # Red Alliance
+        # Red Alliance Calculations
         if r1 in rank_map and r2 in rank_map and b1 in rank_map and b2 in rank_map:
             for t, p in [(r1, r2), (r2, r1)]:
                 teammates[t].append(rank_map[p])
@@ -268,7 +297,7 @@ def analyze_tournament(df_matches, df_rankings_file=None, overrides_text=""):
                 carry_sums[t] += carry
                 audit_rows.append({"Match": m_label, "Team": t, "Alliance": "Red", "Partner": p, "Opponents": f"{b1}, {b2}", "Score": f"{int(r_sc)}-{int(b_sc)}", "Result": "Win" if w=="Red" else ("Tie" if w=="Tie" else "Loss"), "Leverage": round(carry, 2)})
 
-        # Blue Alliance
+        # Blue Alliance Calculations
         if b1 in rank_map and b2 in rank_map and r1 in rank_map and r2 in rank_map:
             for t, p in [(b1, b2), (b2, b1)]:
                 teammates[t].append(rank_map[p])
@@ -338,6 +367,7 @@ def load_all_archived_teams():
         try:
             df = load_tournament_file(path)
             if df is not None and "Team" in df.columns:
+                df = df.copy()
                 df["Tournament"] = os.path.splitext(f)[0]
                 all_records.append(df)
         except Exception:
@@ -345,22 +375,37 @@ def load_all_archived_teams():
     return pd.concat(all_records, ignore_index=True) if all_records else pd.DataFrame()
 
 # ==============================================================================
-# MODE 1: TM EVENT ANALYZER & ARCHIVE (API + UPLOAD SUPPORT)
+# MODE 1: TM EVENT ANALYZER & ARCHIVE (API + UPLOAD + PERSISTENCE)
 # ==============================================================================
 if app_mode == "📊 TM Event Analyzer & Archive":
     st.subheader("📊 Tournament Manager Results, Analytics & Archival")
 
-    st.sidebar.header("📥 Ingestion Method")
-    ingest_source = st.sidebar.radio("Select Source:", ["API Sync (Instant)", "File Upload (.xlsx/.xls/.csv)", "Load From Archive"])
+    # Session State initialization
+    if "df_results" not in st.session_state:
+        st.session_state["df_results"] = None
+    if "df_audit" not in st.session_state:
+        st.session_state["df_audit"] = None
+    if "loaded_source_label" not in st.session_state:
+        st.session_state["loaded_source_label"] = ""
 
-    df_results = None
-    df_audit = None
+    st.sidebar.header("📥 Ingestion Method")
+    ingest_source = st.sidebar.radio(
+        "Select Source:", 
+        ["File Upload (.xlsx/.xls/.csv)", "Load From Archive", "API Sync (Instant)"],
+        index=0
+    )
 
     if ingest_source == "API Sync (Instant)":
         st.sidebar.markdown("### ⚡ Live VEX API Sync")
         api_event_id = st.sidebar.text_input("Event ID / SKU:", placeholder="e.g. 65708 or RE-V5RC-26-XXXX")
+        
+        with st.sidebar.expander("⚙️ API Server Connection Settings"):
+            custom_url = st.text_input("API Base URL:", value=st.secrets.get("VEX_API_BASE_URL", "https://api.3145h.org/v1"))
+            custom_key = st.text_input("API Key (Bearer Token):", value=st.secrets.get("VEX_API_KEY", ""), type="password")
+
         if st.sidebar.button("⚡ Fetch & Analyze Event"):
             if api_event_id.strip():
+                api_client.set_config(custom_url.strip(), custom_key.strip())
                 with st.spinner("Connecting to VEX API..."):
                     try:
                         df_m = api_client.get_event_matches(api_event_id.strip())
@@ -368,23 +413,30 @@ if app_mode == "📊 TM Event Analyzer & Archive":
                             df_r = api_client.get_event_rankings(api_event_id.strip())
                         except Exception:
                             df_r = None
-                        df_results, df_audit = analyze_tournament(df_m, df_r)
+                        res, audit = analyze_tournament(df_m, df_r)
+                        st.session_state["df_results"] = res
+                        st.session_state["df_audit"] = audit
+                        st.session_state["loaded_source_label"] = f"API Event #{api_event_id.strip()}"
                         st.sidebar.success("Event synced from API!")
+                        st.rerun()
                     except Exception as e:
-                        st.sidebar.error(f"API Error: {str(e)}")
+                        st.sidebar.error(str(e))
             else:
-                st.sidebar.warning("Enter a valid Event ID.")
+                st.sidebar.warning("Enter a valid Event ID or SKU.")
 
     elif ingest_source == "Load From Archive":
         st.sidebar.markdown("### 📁 Archive Presets")
         archived_files = get_archived_tournaments()
         if archived_files:
-            selected_archive = st.sidebar.selectbox("Choose Saved Tournament:", archived_files)
-            if selected_archive:
-                archive_path = os.path.join(TOURNAMENTS_DIR, selected_archive)
-                with st.spinner(f"Loading {selected_archive}..."):
-                    df_results = load_tournament_file(archive_path)
-                st.info(f"Loaded tournament archive: **{selected_archive}**")
+            selected_archive = st.sidebar.selectbox("Choose Saved Tournament:", ["-- Select Event --"] + archived_files)
+            if selected_archive != "-- Select Event --":
+                if st.sidebar.button("📂 Load Selected Event"):
+                    archive_path = os.path.join(TOURNAMENTS_DIR, selected_archive)
+                    with st.spinner(f"Loading {selected_archive}..."):
+                        st.session_state["df_results"] = load_tournament_file(archive_path)
+                        st.session_state["loaded_source_label"] = selected_archive
+                        st.session_state["df_audit"] = None
+                        st.rerun()
         else:
             st.sidebar.info("No archives found in `data/tournaments/`.")
 
@@ -395,12 +447,22 @@ if app_mode == "📊 TM Event Analyzer & Archive":
         manual_overrides = st.sidebar.text_area("3. Overrides (Optional)", placeholder="e.g.\nTie: Qualifier #58\nDQ: Qualifier #12, Red")
         
         if uploaded_matches is not None:
-            with st.spinner("Processing Tournament Data..."):
-                df_m = parse_file(uploaded_matches)
-                df_r = parse_file(uploaded_rankings) if uploaded_rankings is not None else None
-                df_results, df_audit = analyze_tournament(df_m, df_r, manual_overrides)
+            if st.sidebar.button("🚀 Analyze Uploaded Files"):
+                with st.spinner("Processing Tournament Data..."):
+                    df_m = parse_file(uploaded_matches)
+                    df_r = parse_file(uploaded_rankings) if uploaded_rankings is not None else None
+                    res, audit = analyze_tournament(df_m, df_r, manual_overrides)
+                    st.session_state["df_results"] = res
+                    st.session_state["df_audit"] = audit
+                    st.session_state["loaded_source_label"] = uploaded_matches.name
+                    st.rerun()
+
+    # Main Dashboard Render
+    df_results = st.session_state["df_results"]
 
     if df_results is not None:
+        st.info(f"📍 Displaying active tournament: **{st.session_state['loaded_source_label']}**")
+        
         c1, c2, c3 = st.columns(3)
         top_carry = df_results.sort_values("Carry_Factor", ascending=False).iloc[0]
         luckiest = df_results.sort_values("Lucky_Factor", ascending=False).iloc[0]
@@ -418,12 +480,27 @@ if app_mode == "📊 TM Event Analyzer & Archive":
             csv_data = df_results.to_csv(index=False).encode("utf-8")
             st.download_button("📥 Export Clean CSV", data=csv_data, file_name="tournament_analytics.csv", mime="text/csv")
         with b_col2:
-            event_name = st.text_input("Archive Event Name:", value=f"Event_{datetime.now().strftime('%Y%m%d_%H%M')}")
+            event_name = st.text_input("Save As Archive Name:", value=f"Event_{datetime.now().strftime('%Y%m%d_%H%M')}")
             if st.button("💾 Save Event to Tournament Archive"):
                 save_path = os.path.join(TOURNAMENTS_DIR, f"{event_name.strip()}.csv")
                 df_results.to_csv(save_path, index=False)
                 st.success(f"Saved event to archive as `{event_name.strip()}.csv`!")
                 st.rerun()
+    else:
+        st.markdown("---")
+        st.markdown("### 👈 Get Started by Loading Tournament Data")
+        st.write("Choose one of the three options from the sidebar to populate the analytics board:")
+        
+        col_card1, col_card2, col_card3 = st.columns(3)
+        with col_card1:
+            st.markdown("#### 📤 File Upload")
+            st.caption("Upload your raw Tournament Manager qualification match export (`.xlsx`, `.xls`, or `.csv`). Official rankings are optional.")
+        with col_card2:
+            st.markdown("#### 📁 Archive Presets")
+            st.caption("Load any tournament previously saved or committed into the repository's `data/tournaments/` folder.")
+        with col_card3:
+            st.markdown("#### ⚡ Live API Sync")
+            st.caption("Enter a VEX Event ID / SKU to stream match schedules and official rankings directly.")
 
 # ==============================================================================
 # MODE 2: TOP 25 COMMUNITY VOTING & CONSENSUS POLL
@@ -632,6 +709,7 @@ elif app_mode == "🔮 Future Tournament Sandbox":
     tot_ap = int(pred_data["AP"].sum())
     ap_unit = target_matches * 6
 
+    # Validation Engine
     validation_errors = []
     if tot_wins != tot_losses:
         validation_errors.append(f"❌ **Wins/Losses Imbalance:** Total Wins ({tot_wins}) does not equal Total Losses ({tot_losses}).")
