@@ -21,7 +21,7 @@ os.makedirs(BALLOTS_DIR, exist_ok=True)
 # ==========================================
 class VexApiClient:
     def __init__(self):
-        # Locked in background; never exposed to user UI
+        # Background configuration; not exposed to end-users
         self.base_url = st.secrets.get("VEX_API_BASE_URL", "https://api.3145h.org/v1").rstrip("/")
         self.api_key = st.secrets.get("VEX_API_KEY", "")
         self.session = requests.Session()
@@ -47,7 +47,7 @@ class VexApiClient:
         query = str(event_query).strip()
         query_upper = query.upper()
 
-        # 1. Try direct lookup via /events/{id_or_sku}
+        # 1. Direct lookup via /events/{id_or_sku}
         try:
             res = self._get(f"/events/{query}")
             data = res.get("data", res) if isinstance(res, dict) else res
@@ -58,7 +58,7 @@ class VexApiClient:
         except Exception:
             pass
 
-        # 2. Search /events collection with strict SKU/code matching
+        # 2. Search /events collection with strict SKU matching
         for param_key in ["sku", "sku[]", "code", "search"]:
             try:
                 res = self._get("/events", params={param_key: query})
@@ -101,8 +101,37 @@ class VexApiClient:
             page += 1
         return pd.DataFrame(all_teams)
 
-    def get_event_matches(self, event_id: str | int) -> pd.DataFrame:
-        # 1. Build team ID -> Number mapping table
+    def get_event_matches(self, event_id: str | int) -> tuple[pd.DataFrame, dict]:
+        """
+        Fetches event matches by discovering all division IDs for the event.
+        Returns (DataFrame, debug_info_dict).
+        """
+        debug_log = {
+            "event_id": str(event_id),
+            "discovered_divisions": [],
+            "endpoints_probed": [],
+            "raw_match_count": 0,
+            "sample_raw_match": None
+        }
+
+        # 1. Discover Division IDs from /events/{event_id}
+        division_ids = []
+        try:
+            ev_res = self._get(f"/events/{event_id}")
+            ev_obj = ev_res.get("data", ev_res) if isinstance(ev_res, dict) else ev_res
+            if isinstance(ev_obj, dict):
+                divs = ev_obj.get("divisions", [])
+                if isinstance(divs, list):
+                    for d in divs:
+                        if isinstance(d, dict) and "id" in d:
+                            division_ids.append(d["id"])
+                            debug_log["discovered_divisions"].append({"id": d["id"], "name": d.get("name")})
+                        elif isinstance(d, (int, str)):
+                            division_ids.append(d)
+        except Exception as e:
+            debug_log["event_fetch_error"] = str(e)
+
+        # 2. Build team ID -> Number mapping
         id_to_num = {}
         try:
             raw_t = self._get(f"/events/{event_id}/teams", params={"per_page": 100})
@@ -129,46 +158,62 @@ class VexApiClient:
             s = str(val).strip()
             return id_to_num.get(s, s)
 
-        # 2. Try multiple endpoint and division variants
-        candidate_endpoints = [
+        # 3. Assemble candidate endpoints
+        endpoints_to_try = []
+        for div in division_ids:
+            endpoints_to_try.append((f"/events/{event_id}/divisions/{div}/matches", {}))
+            endpoints_to_try.append((f"/events/{event_id}/matches", {"division": div}))
+            endpoints_to_try.append((f"/events/{event_id}/matches", {"division_id": div}))
+
+        endpoints_to_try.extend([
             (f"/events/{event_id}/matches", {}),
             (f"/events/{event_id}/matches", {"division_id": 1}),
             (f"/events/{event_id}/matches", {"division": 1}),
             (f"/events/{event_id}/divisions/1/matches", {}),
             (f"/events/{event_id}/divisions/2/matches", {}),
-        ]
+        ])
 
         raw_match_list = []
-        for ep, ep_params in candidate_endpoints:
+        for ep, ep_params in endpoints_to_try:
             try:
+                debug_log["endpoints_probed"].append({"url": ep, "params": ep_params})
                 payload = self._get(ep, params={**ep_params, "per_page": 100})
                 data = payload.get("data", payload) if isinstance(payload, dict) else payload
                 if isinstance(data, list) and len(data) > 0:
-                    raw_match_list = data
-                    break
+                    raw_match_list.extend(data)
             except Exception:
                 continue
 
-        if not raw_match_list:
-            return pd.DataFrame()
-
-        # 3. Parse matches
-        all_matches = []
+        # Deduplicate matches
+        seen_matches = set()
+        unique_matches = []
         for m in raw_match_list:
-            if not isinstance(m, dict):
-                continue
+            if isinstance(m, dict):
+                m_uid = str(m.get("id") or m.get("name") or (m.get("round"), m.get("matchnum")))
+                if m_uid not in seen_matches:
+                    seen_matches.add(m_uid)
+                    unique_matches.append(m)
 
+        debug_log["raw_match_count"] = len(unique_matches)
+        if unique_matches:
+            debug_log["sample_raw_match"] = unique_matches[0]
+
+        if not unique_matches:
+            return pd.DataFrame(), debug_log
+
+        # 4. Parse matches into standard schema
+        all_matches = []
+        for m in unique_matches:
             m_name = str(m.get("name") or f"Qualifier #{m.get('matchnum', '')}").strip()
             m_lower = m_name.lower()
 
-            # Skip eliminations
             if any(x in m_lower for x in ["round of 16", "quarterfinal", "semifinal", "final", "qf", "sf", "f#"]):
                 continue
 
             r1, r2, b1, b2 = "", "", "", ""
             r_sc, b_sc = 0.0, 0.0
 
-            # Format A: RobotEvents / Axum alliances array
+            # Format A: RobotEvents alliances structure
             if "alliances" in m and isinstance(m["alliances"], list):
                 red = next((a for a in m["alliances"] if isinstance(a, dict) and str(a.get("color", "")).lower() == "red"), {})
                 blue = next((a for a in m["alliances"] if isinstance(a, dict) and str(a.get("color", "")).lower() == "blue"), {})
@@ -189,7 +234,7 @@ class VexApiClient:
                 r_sc = float(red.get("score") or red.get("points") or 0.0)
                 b_sc = float(blue.get("score") or blue.get("points") or 0.0)
 
-            # Format B: Flat dictionary
+            # Format B: Flat keys
             else:
                 r1 = resolve_num(m.get("red_1") or m.get("red1") or m.get("red_team_1"))
                 r2 = resolve_num(m.get("red_2") or m.get("red2") or m.get("red_team_2"))
@@ -213,7 +258,7 @@ class VexApiClient:
                     "Winner": winner
                 })
 
-        return pd.DataFrame(all_matches)
+        return pd.DataFrame(all_matches), debug_log
 
     def get_event_rankings(self, event_id: str | int) -> pd.DataFrame:
         payload = self._get(f"/events/{event_id}/rankings")
@@ -511,13 +556,17 @@ if app_mode == "📊 TM Event Analyzer & Archive":
                         target_id, event_title = api_client.resolve_event(api_event_input.strip())
                         st.sidebar.success(f"Connected: **{event_title}**")
                         
-                        df_m = api_client.get_event_matches(target_id)
+                        df_m, debug_info = api_client.get_event_matches(target_id)
                         
                         if df_m.empty:
                             st.sidebar.warning(f"⚠️ **{event_title}** has no qualification matches published in the API yet.")
+                            
                             df_t = api_client.get_event_teams(target_id)
                             if not df_t.empty:
                                 st.sidebar.info(f"💡 Found **{len(df_t)} registered teams** for this event. You can load this roster into the Sandbox.")
+                                
+                            with st.sidebar.expander("🔍 Diagnostics (API Probe Details)"):
+                                st.json(debug_info)
                         else:
                             try:
                                 df_r = api_client.get_event_rankings(target_id)
