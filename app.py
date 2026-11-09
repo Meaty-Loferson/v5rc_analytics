@@ -111,7 +111,6 @@ class VexApiClient:
             "raw_match_count": 0,
         }
 
-        # Probe match endpoints
         endpoints_to_try = [
             (f"/events/{event_id}/matches", {}),
             (f"/events/{event_id}/matches", {"per_page": 250}),
@@ -551,7 +550,6 @@ if app_mode == "📊 TM Event Analyzer & Archive":
                             st.session_state["df_audit"] = audit
                             st.session_state["loaded_source_label"] = f"{event_title} ({target_id})"
                             
-                            # Cleanly preset the archive name box to the tournament title
                             clean_preset = re.sub(r'[\\/*?:"<>|]', "", f"{event_title}_{target_id}").strip().replace(" ", "_")
                             st.session_state["archive_name_input"] = clean_preset
                             st.rerun()
@@ -599,7 +597,17 @@ if app_mode == "📊 TM Event Analyzer & Archive":
     df_results = st.session_state["df_results"]
 
     if df_results is not None:
-        st.info(f"📍 Displaying active tournament: **{st.session_state['loaded_source_label']}**")
+        # Header banner with instant Close/Clear button
+        banner_col, clear_col = st.columns([5, 1])
+        with banner_col:
+            st.info(f"📍 Displaying active tournament: **{st.session_state['loaded_source_label']}**")
+        with clear_col:
+            if st.button("❌ Close Event"):
+                st.session_state["df_results"] = None
+                st.session_state["df_audit"] = None
+                st.session_state["loaded_source_label"] = ""
+                st.session_state["archive_name_input"] = ""
+                st.rerun()
         
         c1, c2, c3 = st.columns(3)
         top_carry = df_results.sort_values("Carry_Factor", ascending=False).iloc[0]
@@ -617,23 +625,39 @@ if app_mode == "📊 TM Event Analyzer & Archive":
         with b_col1:
             csv_data = df_results.to_csv(index=False).encode("utf-8")
             st.download_button("📥 Export Clean CSV", data=csv_data, file_name="tournament_analytics.csv", mime="text/csv")
-        with b_col2:
-            if not st.session_state.get("archive_name_input"):
-                raw_title = st.session_state.get("loaded_source_label", "Event")
-                st.session_state["archive_name_input"] = re.sub(r'[\\/*?:"<>|]', "", raw_title).strip().replace(" ", "_")
-
-            st.text_input("Save As Archive Name:", key="archive_name_input")
             
-            if st.button("💾 Save Event to Tournament Archive"):
-                entered_name = st.session_state.get("archive_name_input", "").strip()
-                cleaned_name = re.sub(r'[\\/*?:"<>|]', "", entered_name).strip().replace(" ", "_")
-                if not cleaned_name:
-                    cleaned_name = f"Event_{datetime.now().strftime('%Y%m%d_%H%M')}"
+        with b_col2:
+            # If viewing an archive, offer to delete it directly
+            if ingest_source == "Load From Archive":
+                active_label = st.session_state.get("loaded_source_label", "")
+                target_fname = active_label if active_label.endswith(".csv") else f"{active_label}.csv"
+                target_path = os.path.join(TOURNAMENTS_DIR, target_fname)
                 
-                save_path = os.path.join(TOURNAMENTS_DIR, f"{cleaned_name}.csv")
-                df_results.to_csv(save_path, index=False)
-                st.success(f"Saved event to archive as `{cleaned_name}.csv`!")
-                st.rerun()
+                if os.path.exists(target_path):
+                    if st.button(f"🗑️ Delete '{target_fname}' from Archive"):
+                        os.remove(target_path)
+                        st.session_state["df_results"] = None
+                        st.session_state["loaded_source_label"] = ""
+                        st.success(f"Deleted `{target_fname}`!")
+                        st.rerun()
+            # If syncing from API or uploading, show the archive saving controls
+            else:
+                if not st.session_state.get("archive_name_input"):
+                    raw_title = st.session_state.get("loaded_source_label", "Event")
+                    st.session_state["archive_name_input"] = re.sub(r'[\\/*?:"<>|]', "", raw_title).strip().replace(" ", "_")
+
+                st.text_input("Save As Archive Name:", key="archive_name_input")
+                
+                if st.button("💾 Save Event to Tournament Archive"):
+                    entered_name = st.session_state.get("archive_name_input", "").strip()
+                    cleaned_name = re.sub(r'[\\/*?:"<>|]', "", entered_name).strip().replace(" ", "_")
+                    if not cleaned_name:
+                        cleaned_name = f"Event_{datetime.now().strftime('%Y%m%d_%H%M')}"
+                    
+                    save_path = os.path.join(TOURNAMENTS_DIR, f"{cleaned_name}.csv")
+                    df_results.to_csv(save_path, index=False)
+                    st.success(f"Saved event to archive as `{cleaned_name}.csv`!")
+                    st.rerun()
     else:
         st.markdown("---")
         st.markdown("### 👈 Get Started by Loading Tournament Data")
