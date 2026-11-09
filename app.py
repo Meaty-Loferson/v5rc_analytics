@@ -102,20 +102,18 @@ class VexApiClient:
         return pd.DataFrame(all_teams)
 
     def get_event_matches(self, event_id: str | int) -> pd.DataFrame:
-        # Pre-fetch registered teams to map internal numeric team IDs (e.g. 78936 -> "11124R")
+        # 1. Build team ID -> Number mapping table
         id_to_num = {}
         try:
-            df_teams_ref = self.get_event_teams(event_id)
-            if not df_teams_ref.empty:
-                raw_t = self._get(f"/events/{event_id}/teams", params={"per_page": 100})
-                t_list = raw_t.get("data", raw_t) if isinstance(raw_t, dict) else raw_t
-                if isinstance(t_list, list):
-                    for item in t_list:
-                        if isinstance(item, dict):
-                            t_id = str(item.get("id", ""))
-                            t_num = str(item.get("number", item.get("team_name", ""))).strip()
-                            if t_id and t_num:
-                                id_to_num[t_id] = t_num
+            raw_t = self._get(f"/events/{event_id}/teams", params={"per_page": 100})
+            t_list = raw_t.get("data", raw_t) if isinstance(raw_t, dict) else raw_t
+            if isinstance(t_list, list):
+                for item in t_list:
+                    if isinstance(item, dict):
+                        t_id = str(item.get("id", ""))
+                        t_num = str(item.get("number", item.get("team_name", ""))).strip()
+                        if t_id and t_num:
+                            id_to_num[t_id] = t_num
         except Exception:
             pass
 
@@ -131,78 +129,89 @@ class VexApiClient:
             s = str(val).strip()
             return id_to_num.get(s, s)
 
+        # 2. Try multiple endpoint and division variants
+        candidate_endpoints = [
+            (f"/events/{event_id}/matches", {}),
+            (f"/events/{event_id}/matches", {"division_id": 1}),
+            (f"/events/{event_id}/matches", {"division": 1}),
+            (f"/events/{event_id}/divisions/1/matches", {}),
+            (f"/events/{event_id}/divisions/2/matches", {}),
+        ]
+
+        raw_match_list = []
+        for ep, ep_params in candidate_endpoints:
+            try:
+                payload = self._get(ep, params={**ep_params, "per_page": 100})
+                data = payload.get("data", payload) if isinstance(payload, dict) else payload
+                if isinstance(data, list) and len(data) > 0:
+                    raw_match_list = data
+                    break
+            except Exception:
+                continue
+
+        if not raw_match_list:
+            return pd.DataFrame()
+
+        # 3. Parse matches
         all_matches = []
-        page = 1
+        for m in raw_match_list:
+            if not isinstance(m, dict):
+                continue
 
-        while True:
-            payload = self._get(f"/events/{event_id}/matches", params={"page": page, "per_page": 100})
-            data = payload.get("data", payload) if isinstance(payload, dict) else payload
-            if not isinstance(data, list) or not data:
-                break
+            m_name = str(m.get("name") or f"Qualifier #{m.get('matchnum', '')}").strip()
+            m_lower = m_name.lower()
 
-            for m in data:
-                if not isinstance(m, dict):
-                    continue
+            # Skip eliminations
+            if any(x in m_lower for x in ["round of 16", "quarterfinal", "semifinal", "final", "qf", "sf", "f#"]):
+                continue
 
-                m_name = str(m.get("name") or f"Qualifier #{m.get('matchnum', '')}").strip()
-                m_lower = m_name.lower()
+            r1, r2, b1, b2 = "", "", "", ""
+            r_sc, b_sc = 0.0, 0.0
 
-                # Filter out elimination bracket matches
-                if any(x in m_lower for x in ["round of 16", "quarterfinal", "semifinal", "final", "qf", "sf", "f#"]):
-                    continue
+            # Format A: RobotEvents / Axum alliances array
+            if "alliances" in m and isinstance(m["alliances"], list):
+                red = next((a for a in m["alliances"] if isinstance(a, dict) and str(a.get("color", "")).lower() == "red"), {})
+                blue = next((a for a in m["alliances"] if isinstance(a, dict) and str(a.get("color", "")).lower() == "blue"), {})
 
-                r1, r2, b1, b2 = "", "", "", ""
-                r_sc, b_sc = 0.0, 0.0
+                r_teams = [resolve_num(t) for t in red.get("teams", []) if resolve_num(t)]
+                b_teams = [resolve_num(t) for t in blue.get("teams", []) if resolve_num(t)]
 
-                # Format A: Nested RobotEvents / Axum alliances
-                if "alliances" in m and isinstance(m["alliances"], list):
-                    red = next((a for a in m["alliances"] if isinstance(a, dict) and str(a.get("color", "")).lower() == "red"), {})
-                    blue = next((a for a in m["alliances"] if isinstance(a, dict) and str(a.get("color", "")).lower() == "blue"), {})
+                if len(r_teams) >= 2:
+                    r1, r2 = r_teams[0], r_teams[1]
+                elif len(r_teams) == 1:
+                    r1, r2 = r_teams[0], r_teams[0]
 
-                    r_teams = [resolve_num(t) for t in red.get("teams", []) if resolve_num(t)]
-                    b_teams = [resolve_num(t) for t in blue.get("teams", []) if resolve_num(t)]
+                if len(b_teams) >= 2:
+                    b1, b2 = b_teams[0], b_teams[1]
+                elif len(b_teams) == 1:
+                    b1, b2 = b_teams[0], b_teams[0]
 
-                    if len(r_teams) >= 2:
-                        r1, r2 = r_teams[0], r_teams[1]
-                    elif len(r_teams) == 1:
-                        r1, r2 = r_teams[0], r_teams[0]
+                r_sc = float(red.get("score") or red.get("points") or 0.0)
+                b_sc = float(blue.get("score") or blue.get("points") or 0.0)
 
-                    if len(b_teams) >= 2:
-                        b1, b2 = b_teams[0], b_teams[1]
-                    elif len(b_teams) == 1:
-                        b1, b2 = b_teams[0], b_teams[0]
+            # Format B: Flat dictionary
+            else:
+                r1 = resolve_num(m.get("red_1") or m.get("red1") or m.get("red_team_1"))
+                r2 = resolve_num(m.get("red_2") or m.get("red2") or m.get("red_team_2"))
+                b1 = resolve_num(m.get("blue_1") or m.get("blue1") or m.get("blue_team_1"))
+                b2 = resolve_num(m.get("blue_2") or m.get("blue2") or m.get("blue_team_2"))
+                r_sc = float(m.get("red_score") or m.get("redscore") or m.get("red_points") or 0.0)
+                b_sc = float(m.get("blue_score") or m.get("bluescore") or m.get("blue_points") or 0.0)
 
-                    r_sc = float(red.get("score") or red.get("points") or 0.0)
-                    b_sc = float(blue.get("score") or blue.get("points") or 0.0)
-
-                # Format B: Flat keys (e.g. red_1, red_2, blue_1, blue_2 or red1, red2)
-                else:
-                    r1 = resolve_num(m.get("red_1") or m.get("red1") or m.get("red_team_1"))
-                    r2 = resolve_num(m.get("red_2") or m.get("red2") or m.get("red_team_2"))
-                    b1 = resolve_num(m.get("blue_1") or m.get("blue1") or m.get("blue_team_1"))
-                    b2 = resolve_num(m.get("blue_2") or m.get("blue2") or m.get("blue_team_2"))
-                    r_sc = float(m.get("red_score") or m.get("redscore") or m.get("red_points") or 0.0)
-                    b_sc = float(m.get("blue_score") or m.get("bluescore") or m.get("blue_points") or 0.0)
-
-                if r1 and b1:
-                    if not r2: r2 = r1
-                    if not b2: b2 = b1
-                    winner = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
-                    all_matches.append({
-                        "Match": m_name,
-                        "Red Team 1": r1,
-                        "Red Team 2": r2,
-                        "Blue Team 1": b1,
-                        "Blue Team 2": b2,
-                        "Red Score": r_sc,
-                        "Blue Score": b_sc,
-                        "Winner": winner
-                    })
-
-            pagination = payload.get("pagination", {}) if isinstance(payload, dict) else {}
-            if page >= pagination.get("total_pages", 1):
-                break
-            page += 1
+            if r1 and b1:
+                if not r2: r2 = r1
+                if not b2: b2 = b1
+                winner = "Red" if r_sc > b_sc else ("Blue" if b_sc > r_sc else "Tie")
+                all_matches.append({
+                    "Match": m_name,
+                    "Red Team 1": r1,
+                    "Red Team 2": r2,
+                    "Blue Team 1": b1,
+                    "Blue Team 2": b2,
+                    "Red Score": r_sc,
+                    "Blue Score": b_sc,
+                    "Winner": winner
+                })
 
         return pd.DataFrame(all_matches)
 
